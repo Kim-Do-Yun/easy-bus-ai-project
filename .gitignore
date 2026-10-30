@@ -1,0 +1,32 @@
+# --- Python / FastAPI (easy_bus_backend) ---
+easy_bus_backend/__pycache__/
+easy_bus_backend/.venv/
+easy_bus_backend/venv/
+easy_bus_backend/.idea/
+*.pyc
+*.pyo
+
+# --- Flutter / Android / iOS (easy_bus_ai) ---
+# Flutter/Dart specific
+easy_bus_ai/.dart_tool/
+easy_bus_ai/.pub-cache/
+easy_bus_ai/.pub/
+easy_bus_ai/build/
+easy_bus_ai/.lock
+
+# Android specific
+easy_bus_ai/android/.gradle/
+easy_bus_ai/android/local.properties
+easy_bus_ai/android/app/build/
+
+# iOS specific
+easy_bus_ai/ios/Flutter/Flutter.podspec
+easy_bus_ai/ios/Pods/
+easy_bus_ai/ios/.symlinks/
+
+# IDE / Editor (VS Code, Android Studio, IntelliJ)
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
