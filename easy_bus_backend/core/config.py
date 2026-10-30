@@ -1,0 +1,25 @@
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+load_dotenv(BASE_DIR / ".env", override=False)
+
+
+def data_path(name: str, default: str) -> Path:
+    # 상대 경로는 서버 실행 위치와 관계없이 백엔드 폴더를 기준으로 해석한다.
+    path = Path(os.getenv(name, default))
+    return path if path.is_absolute() else BASE_DIR / path
+
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:1.7b")
+AI_TIMEOUT = float(os.getenv("AI_TIMEOUT", "120"))
+WHISPER_PATH = data_path("WHISPER_PATH", "models/whisper/small")
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+STOPS_PATH = data_path("STOPS_PATH", "data/processed/stops.json")
+ROUTES_PATH = data_path("ROUTES_PATH", "data/processed/routes.json")
+MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", "10485760"))
+MAX_AUDIO_SECONDS = int(os.getenv("MAX_AUDIO_SECONDS", "60"))
