@@ -46,3 +46,6 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# 실제 앱 설정은 로컬에서 관리하고 예시 파일만 공유한다.
+/config/app.json

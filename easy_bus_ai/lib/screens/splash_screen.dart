@@ -24,6 +24,7 @@ class _SplashScreenState extends State<SplashScreen> {
 
   Future<void> _initialize() async {
     try {
+      // config/app.json을 --dart-define-from-file로 전달한 앱용 지도 설정을 읽는다.
       const clientId = String.fromEnvironment('NAVER_MAP_CLIENT_ID');
       if (clientId.isEmpty)
         throw Exception('네이버 지도 Client ID를 설정한 뒤 앱을 다시 실행해 주세요.');

@@ -67,7 +67,7 @@ def transcribe(path: str) -> str:
         with wave.open(path, "rb") as audio:
             duration = audio.getnframes() / audio.getframerate()
             if not 0 < duration <= config.MAX_AUDIO_SECONDS:
-                raise ServiceError("AUDIO_DURATION", "음성은 60초 이내로 녹음해 주세요.", 422)
+                raise ServiceError("AUDIO_DURATION", f"음성은 {config.MAX_AUDIO_SECONDS}초 이내로 녹음해 주세요.", 422)
     except (wave.Error, EOFError, ZeroDivisionError) as exc:
         raise ServiceError("INVALID_AUDIO", "올바른 PCM WAV 음성 파일이 아닙니다.", 415) from exc
     # 로딩과 추론을 직렬화하여 모델 중복 생성 및 CPU 과부하를 방지한다.

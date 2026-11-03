@@ -14,6 +14,7 @@ class ApiException implements Exception {
 }
 
 class ApiService {
+  // config/app.json에서 전달하며, 미설정 시 기존 에뮬레이터 주소를 유지한다.
   static const baseUrl = String.fromEnvironment(
     'API_BASE_URL',
     defaultValue: 'http://10.0.2.2:8000',

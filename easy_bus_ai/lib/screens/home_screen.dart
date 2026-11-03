@@ -26,6 +26,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   BusRoute? _route;
   int _request = 0;
   bool _loading = false;
+  bool _audioTransition = false;
   Timer? _loadingTimer, _recordTimer;
   final List<NOverlayInfo> _routeOverlays = [];
   Future<void> _mapQueue = Future.value();
@@ -142,7 +143,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _search({String? audioPath}) async {
-    if (_busy) return;
+    if (_busy || _phase == HomePhase.recording) return;
     final id = _begin();
     try {
       var originName = _origin.text.trim();
@@ -177,7 +178,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final result = routes.first;
       await _replaceRoute(result, id);
       if (!_valid(id)) return;
-      setState(() => _route = result);
       try {
         await _device.speak(result.guidance);
       } catch (error) {
@@ -210,7 +210,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _replaceRoute(BusRoute route, int id) {
     // 지도 변경을 순서대로 실행하여 취소된 응답이 새 경로를 덮어쓰지 않게 한다.
     final task = _mapQueue.then((_) async {
-      if (!_valid(id) || _map == null) return;
+      if (!_valid(id)) return;
+      if (_map == null) throw Exception('지도가 준비된 뒤 다시 검색해 주세요.');
       final added = <NOverlayInfo>[];
       try {
         for (var i = 0; i < route.segments.length; i++) {
@@ -277,27 +278,37 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _microphone() async {
-    if (_busy) return;
+    if (_busy || _audioTransition) return;
     if (_phase == HomePhase.recording) {
       _recordTimer?.cancel();
       // 녹음 종료 중에도 중복 탭을 막는다.
       final id = _begin();
+      setState(() => _audioTransition = true);
+      String? recordedPath;
       try {
         final path = await _device.stopRecording();
         if (!_valid(id)) {
           await _device.deleteRecording(path);
           return;
         }
-        setState(() => _phase = HomePhase.map);
-        await _search(audioPath: path);
+        recordedPath = path;
       } catch (error) {
         if (_valid(id)) {
           _cancelRequest();
           _notice(error);
         }
+      } finally {
+        if (mounted) setState(() => _audioTransition = false);
+      }
+      // 녹음 장치 전환을 끝낸 뒤 서버 요청을 시작한다.
+      if (_valid(id) && recordedPath != null) {
+        setState(() => _phase = HomePhase.map);
+        await _search(audioPath: recordedPath);
       }
     } else {
       final id = _begin();
+      // 권한 창이 열린 동안 취소해도 이전 시작 작업이 끝나기 전에는 재녹음을 막는다.
+      setState(() => _audioTransition = true);
       try {
         await _device.startRecording();
         if (!_valid(id)) {
@@ -315,6 +326,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           _cancelRequest();
           _notice(error);
         }
+      } finally {
+        if (mounted) setState(() => _audioTransition = false);
       }
     }
   }
@@ -336,10 +349,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (_phase == HomePhase.recording) {
       _recordTimer?.cancel();
       _cancelRequest();
+      setState(() => _audioTransition = true);
       try {
         await _device.cancelRecording();
       } catch (error) {
         _notice(error);
+      } finally {
+        if (mounted) setState(() => _audioTransition = false);
       }
       return;
     }
@@ -348,7 +364,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _route = null;
       _phase = HomePhase.map;
     });
-    await _device.stopSpeaking();
+    // TTS 종료를 기다리는 동안 새 경로가 먼저 큐에 들어가지 않도록 지도 정리를 예약한다.
     final task = _mapQueue.then((_) async {
       if (!mounted || _map == null) return;
       for (final info in _routeOverlays) {
@@ -359,19 +375,34 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _mapQueue = task.catchError((Object error) {
       _notice(error);
     });
+    try {
+      await _device.stopSpeaking();
+    } catch (error) {
+      _notice('음성 안내를 중지하지 못했습니다.');
+    }
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.paused &&
         (_busy || _phase == HomePhase.recording)) {
+      final wasRecording = _phase == HomePhase.recording;
       _recordTimer?.cancel();
       _cancelRequest();
-      unawaited(
-        _device.cancelRecording().catchError((Object error) {
-          _notice(error);
-        }),
-      );
+      // 업로드 중인 파일은 검색 작업이 정리하고 진행 중 녹음만 여기서 취소한다.
+      if (wasRecording && !_audioTransition) {
+        setState(() => _audioTransition = true);
+        unawaited(
+          _device
+              .cancelRecording()
+              .catchError((Object error) {
+                _notice(error);
+              })
+              .whenComplete(() {
+                if (mounted) setState(() => _audioTransition = false);
+              }),
+        );
+      }
     }
   }
 
@@ -580,7 +611,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   height: 80,
                   width: 180,
                   child: FilledButton.icon(
-                    onPressed: _busy ? null : _microphone,
+                    onPressed: _busy || _audioTransition ? null : _microphone,
                     style: FilledButton.styleFrom(
                       backgroundColor: _phase == HomePhase.recording
                           ? Colors.red

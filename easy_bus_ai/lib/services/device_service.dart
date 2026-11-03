@@ -12,6 +12,7 @@ class DeviceService {
   final FlutterTts _tts = FlutterTts();
   String? _path;
   String? _lastGuidance;
+  int _speechRequest = 0;
 
   Future<Place> currentPosition() async {
     if (!await Geolocator.isLocationServiceEnabled()) {
@@ -68,10 +69,15 @@ class DeviceService {
   }
 
   Future<void> speak(String text) async {
+    final request = ++_speechRequest;
     _lastGuidance = text;
     await _tts.stop();
+    // 중지 또는 새 안내 요청 이후에는 이전 비동기 설정의 재생을 무효화한다.
+    if (request != _speechRequest) return;
     await _tts.setLanguage('ko-KR');
+    if (request != _speechRequest) return;
     await _tts.setSpeechRate(0.4);
+    if (request != _speechRequest) return;
     await _tts.speak(text);
   }
 
@@ -80,12 +86,20 @@ class DeviceService {
   }
 
   Future<void> stopSpeaking() async {
+    ++_speechRequest;
     await _tts.stop();
   }
 
   Future<void> dispose() async {
-    await stopSpeaking();
-    await cancelRecording();
-    await _recorder.dispose();
+    // 한 장치의 정리 실패가 다른 장치 자원 해제를 건너뛰지 않게 한다.
+    try {
+      await stopSpeaking();
+    } finally {
+      try {
+        await cancelRecording();
+      } finally {
+        await _recorder.dispose();
+      }
+    }
   }
 }
