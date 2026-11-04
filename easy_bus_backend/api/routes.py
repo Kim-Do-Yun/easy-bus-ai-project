@@ -21,6 +21,10 @@ class Coordinate(BaseModel):
 class Place(Coordinate):
     id: str
     name: str
+    # 기존 앱 필드는 유지하고 공급자 식별자와 주소를 선택 정보로 보존한다.
+    address: str | None = None
+    local_station_id: str | None = None
+    tago_id: str | None = None
 
 
 class Stop(Place):
@@ -30,11 +34,21 @@ class Stop(Place):
 class BusLine(BaseModel):
     id: str
     number: str
+    local_route_id: str | None = None
+    tago_id: str | None = None
+    direction: str | None = None
+    boarding_order: int | None = None
+    alighting_order: int | None = None
 
 
 class Arrival(BaseModel):
     status: Literal["unavailable", "available"] = "unavailable"
     minutes: int | None = None
+    # 도착예정시간과 경로 이동시간을 구분하고 조회 시점과 미제공 사유를 남긴다.
+    seconds: int | None = None
+    remaining_stops: int | None = None
+    observed_at: str | None = None
+    reason: str | None = None
 
 
 class Segment(BaseModel):
@@ -45,12 +59,15 @@ class Segment(BaseModel):
     geometry_status: Literal["available", "unavailable"] = "unavailable"
     coordinates: list[Coordinate] = Field(default_factory=list)
     arrival: Arrival = Field(default_factory=Arrival)
+    duration_minutes: float | None = None
+    geometry_reason: str | None = None
 
 
 class Route(BaseModel):
     id: str
     segments: list[Segment]
     transfer_count: int
+    duration_minutes: float | None = None
 
 
 class RouteRequest(BaseModel):

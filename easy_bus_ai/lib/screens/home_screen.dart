@@ -19,7 +19,8 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final _api = ApiService();
   final _device = DeviceService();
-  final _origin = TextEditingController(text: '현재 위치');
+  // 출발지가 비어 있으면 안내 문구를 표시하고 기존 GPS 분기를 사용한다.
+  final _origin = TextEditingController();
   final _destination = TextEditingController();
   NaverMapController? _map;
   HomePhase _phase = HomePhase.map;
@@ -30,12 +31,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Timer? _loadingTimer, _recordTimer;
   final List<NOverlayInfo> _routeOverlays = [];
   Future<void> _mapQueue = Future.value();
+  // 화면 상태별 최초 빌드만 기록하여 재빌드 시 로그가 반복되지 않게 한다.
+  final _initElapsed = Stopwatch();
+  bool _initialBuildLogged = false;
   bool get _busy => _phase == HomePhase.processing;
   bool _valid(int id) => mounted && id == _request;
 
   @override
   void initState() {
     super.initState();
+    _initElapsed.start();
+    debugPrint('[EASY_BUS_INIT] HomeScreen initState 진입 (화면=${_initElapsed.elapsedMilliseconds}ms)');
     WidgetsBinding.instance.addObserver(this);
   }
 
@@ -50,11 +56,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _prepareMap(NaverMapController controller) async {
+    debugPrint('[EASY_BUS_INIT] onMapReady 호출 (화면=${_initElapsed.elapsedMilliseconds}ms)');
     _map = controller;
     final generation = _request;
+    final stageElapsed = Stopwatch()..start();
+    var stage = 'GPS 조회';
     try {
+      debugPrint('[EASY_BUS_INIT] $stage 시작');
       final position = await _device.currentPosition();
+      debugPrint('[EASY_BUS_INIT] $stage 완료 (단계=${stageElapsed.elapsedMilliseconds}ms)');
       if (!mounted) return;
+      stage = '현재 위치 지도 반영';
+      stageElapsed.reset();
       await controller.addOverlay(
         NMarker(
           id: 'current',
@@ -66,8 +79,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         await controller.updateCamera(
           NCameraUpdate.scrollAndZoomTo(target: _latLng(position), zoom: 15),
         );
+      stage = '정류장 조회';
+      stageElapsed.reset();
+      debugPrint('[EASY_BUS_INIT] $stage 시작 (화면=${_initElapsed.elapsedMilliseconds}ms)');
       final stops = await _api.stops(position);
+      debugPrint('[EASY_BUS_INIT] $stage 완료 (단계=${stageElapsed.elapsedMilliseconds}ms)');
       if (!mounted) return;
+      stage = '정류장 지도 반영';
+      stageElapsed.reset();
       for (final stop in stops) {
         await controller.addOverlay(
           NMarker(
@@ -78,6 +97,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         );
       }
     } catch (error) {
+      // 위치와 응답 원문은 제외하고 실패 단계의 유형과 소요 시간만 기록한다.
+      debugPrint('[EASY_BUS_INIT] $stage 예외 유형=${error.runtimeType} '
+          '(단계=${stageElapsed.elapsedMilliseconds}ms)');
       _notice(error);
     }
   }
@@ -161,7 +183,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ? '현재 위치'
             : interpretation.origin ?? '';
         destinationName = interpretation.destination ?? '';
-        _origin.text = originName;
+        // 음성으로 현재 위치를 선택한 경우에도 안내 문구를 입력값으로 넣지 않는다.
+        _origin.text = originName == '현재 위치' ? '' : originName;
         _destination.text = destinationName;
       }
       if (destinationName.isEmpty) throw Exception('목적지를 입력해 주세요.');
@@ -420,7 +443,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   @override
-  Widget build(BuildContext context) => PopScope(
+  Widget build(BuildContext context) {
+    if (!_initialBuildLogged) {
+      _initialBuildLogged = true;
+      debugPrint('[EASY_BUS_INIT] HomeScreen build 최초 진입 (화면=${_initElapsed.elapsedMilliseconds}ms)');
+      debugPrint('[EASY_BUS_INIT] NaverMap 위젯 생성 직전 (화면=${_initElapsed.elapsedMilliseconds}ms)');
+    }
+    return PopScope(
     canPop: !_busy && _phase != HomePhase.recording && _route == null,
     onPopInvokedWithResult: (didPop, result) {
       if (!didPop) _back();
@@ -464,6 +493,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                 decoration: const InputDecoration(
                                   labelText: '출발지',
                                   hintText: '현재 위치',
+                                  floatingLabelBehavior: FloatingLabelBehavior.always,
                                 ),
                               ),
                             ),
@@ -476,6 +506,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           decoration: const InputDecoration(
                             labelText: '목적지',
                             hintText: '어디로 가시나요?',
+                            floatingLabelBehavior: FloatingLabelBehavior.always,
                           ),
                           onSubmitted: (_) => _search(),
                         ),
@@ -491,7 +522,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                     _search();
                                   },
                             child: const Text(
-                              '버스 찾기',
+                              '검색',
                               style: TextStyle(fontSize: 20),
                             ),
                           ),
@@ -610,20 +641,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 child: SizedBox(
                   height: 80,
                   width: 180,
-                  child: FilledButton.icon(
+                  child: FilledButton(
                     onPressed: _busy || _audioTransition ? null : _microphone,
                     style: FilledButton.styleFrom(
                       backgroundColor: _phase == HomePhase.recording
                           ? Colors.red
                           : null,
                     ),
-                    icon: Icon(
+                    child: Icon(
                       _phase == HomePhase.recording ? Icons.stop : Icons.mic,
                       size: 36,
-                    ),
-                    label: Text(
-                      _phase == HomePhase.recording ? '녹음 끝내기' : '말로 찾기',
-                      style: const TextStyle(fontSize: 20),
+                      semanticLabel: _phase == HomePhase.recording
+                          ? '녹음 끝내기'
+                          : '음성으로 목적지 찾기',
                     ),
                   ),
                 ),
@@ -634,4 +664,5 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       ),
     ),
   );
+  }
 }

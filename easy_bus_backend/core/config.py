@@ -32,3 +32,13 @@ TAGO_SERVICE_KEY = os.getenv("TAGO_SERVICE_KEY", "")
 # 도시코드는 실제 원주시 코드를 확인한 뒤 입력하며 임의로 추정하지 않는다.
 TAGO_CITY_CODE = os.getenv("TAGO_CITY_CODE", "")
 SERVICE_REGION = os.getenv("SERVICE_REGION", "wonju")
+
+# 외부 조회와 메모리 캐시의 한도는 실제 인증정보와 별도로 조정한다.
+TRANSIT_HTTP_TIMEOUT = float(os.getenv("TRANSIT_HTTP_TIMEOUT", "10"))
+TRANSIT_REQUEST_SECONDS = float(os.getenv("TRANSIT_REQUEST_SECONDS", "100"))
+TAGO_CACHE_SECONDS = float(os.getenv("TAGO_CACHE_SECONDS", "3600"))
+TAGO_ARRIVAL_CACHE_SECONDS = float(os.getenv("TAGO_ARRIVAL_CACHE_SECONDS", "15"))
+ODSAY_CACHE_SECONDS = float(os.getenv("ODSAY_CACHE_SECONDS", "300"))
+# 요청서의 호출 예산을 기본값으로 사용하며 실제 계정 한도와는 별도로 관리한다.
+ODSAY_DAILY_CALL_LIMIT = int(os.getenv("ODSAY_DAILY_CALL_LIMIT", "30"))
+STOP_MATCH_RADIUS_M = float(os.getenv("STOP_MATCH_RADIUS_M", "60"))
