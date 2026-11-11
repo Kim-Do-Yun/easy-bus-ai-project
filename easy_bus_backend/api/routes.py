@@ -6,8 +6,8 @@ from fastapi import APIRouter, File, Query, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
-from core import config
-from services import ai_service, bus_service, location_service
+from easy_bus_backend.core import config
+from easy_bus_backend.services import ai_service, bus_service, location_service
 
 router = APIRouter(prefix="/api")
 
@@ -25,6 +25,8 @@ class Place(Coordinate):
     address: str | None = None
     local_station_id: str | None = None
     tago_id: str | None = None
+    # 정류장에 표기된 번호이며 ODsay가 제공한 경우에만 채운다.
+    ars_id: str | None = None
 
 
 class Stop(Place):
@@ -61,6 +63,9 @@ class Segment(BaseModel):
     arrival: Arrival = Field(default_factory=Arrival)
     duration_minutes: float | None = None
     geometry_reason: str | None = None
+    # ODsay 구간 이동거리와 버스 경유 정류장 순서이며 미제공 시 비워 둔다.
+    distance_m: float | None = None
+    stops: list[Place] = Field(default_factory=list)
 
 
 class Route(BaseModel):
@@ -68,6 +73,9 @@ class Route(BaseModel):
     segments: list[Segment]
     transfer_count: int
     duration_minutes: float | None = None
+    # ODsay 총 도보거리와 최적 경로 구분이며 기존 필드는 그대로 유지한다.
+    total_walk_m: float | None = None
+    recommendation: Literal["BEST_WALK", "BEST_TIME"] | None = None
 
 
 class RouteRequest(BaseModel):

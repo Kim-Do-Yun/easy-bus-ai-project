@@ -5,8 +5,8 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from core import config
-from services.location_service import ServiceError
+from easy_bus_backend.core import config
+from easy_bus_backend.services.location_service import ServiceError
 
 
 class Interpretation(BaseModel):

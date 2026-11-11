@@ -10,7 +10,7 @@ from urllib.parse import quote, quote_plus, unquote
 
 import httpx
 
-from core import config
+from easy_bus_backend.core import config
 
 
 class ServiceError(Exception):

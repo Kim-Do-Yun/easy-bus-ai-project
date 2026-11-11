@@ -5,8 +5,8 @@ from time import monotonic
 from threading import Lock
 from urllib.parse import unquote
 
-from core import config
-from services.location_service import (ServiceError, validate_coordinate, distance_m,
+from easy_bus_backend.core import config
+from easy_bus_backend.services.location_service import (ServiceError, validate_coordinate, distance_m,
                                        cached, request_json, tago_error)
 
 
@@ -242,7 +242,43 @@ def _odsay_place(part, prefix):
         raise ValueError() from None
     return {"id": _text(part[prefix + "ID"]), "name": _text(part[prefix + "Name"]),
             "latitude": latitude, "longitude": longitude,
-            "local_station_id": str(part.get(prefix + "LocalStationID") or "") or None}
+            "local_station_id": str(part.get(prefix + "LocalStationID") or "") or None,
+            "ars_id": _ars_id(part.get(prefix + "ArsID"))}
+
+
+def _ars_id(value):
+    # 정류장 번호가 없거나 공란 기호이면 임의 번호를 만들지 않고 비워 둔다.
+    text = "" if value is None or isinstance(value, (dict, list, bool)) else str(value).strip()
+    return None if text in ("", "-", "0") else text
+
+
+def _optional_number(value):
+    # 선택 수치는 형식이 맞지 않으면 추정하지 않고 미제공으로 처리한다.
+    try:
+        return None if value in (None, "") else _number(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pass_stops(part, start, end):
+    # 노선 순서의 경유 정류장은 승하차 정류장과 양 끝이 일치할 때만 사용한다.
+    try:
+        stations = part["passStopList"]["stations"]
+        if not isinstance(stations, list) or len(stations) < 2:
+            return []
+        stops = []
+        for station in stations:
+            latitude, longitude = float(station["y"]), float(station["x"])
+            validate_coordinate(latitude, longitude)
+            stops.append({"id": _text(station["stationID"]), "name": _text(station["stationName"]),
+                          "latitude": latitude, "longitude": longitude,
+                          "local_station_id": str(station.get("localStationID") or "") or None,
+                          "ars_id": _ars_id(station.get("arsID"))})
+        if stops[0]["id"] != start["id"] or stops[-1]["id"] != end["id"]:
+            return []
+        return stops
+    except (KeyError, TypeError, ValueError, ServiceError):
+        return []
 
 
 def _convert_path(path, origin, destination):
@@ -263,12 +299,14 @@ def _convert_path(path, origin, destination):
         segment = {"type": "BUS" if part["trafficType"] == 2 else "WALK",
                    "geometry_status": "unavailable", "coordinates": [],
                    "arrival": {"status": "unavailable", "minutes": None, "reason": "NOT_REQUESTED"},
-                   "duration_minutes": _number(part["sectionTime"])}
+                   "duration_minutes": _number(part["sectionTime"]),
+                   "distance_m": _optional_number(part.get("distance")), "stops": []}
         if part["trafficType"] == 2:
             lane = part["lane"][0]
             segment.update(start=_odsay_place(part, "start"), end=_odsay_place(part, "end"),
                            bus={"id": _text(lane["busID"]), "number": _text(lane["busNo"]),
                                 "local_route_id": str(lane.get("busLocalBlID") or "") or None})
+            segment["stops"] = _pass_stops(part, segment["start"], segment["end"])
         else:
             previous = next((p for p in reversed(parts[:index]) if p["trafficType"] == 2), None)
             following = next((p for p in parts[index + 1:] if p["trafficType"] == 2), None)
@@ -278,7 +316,85 @@ def _convert_path(path, origin, destination):
     signature = repr((origin, destination, path["info"]["mapObj"]))
     return {"id": "odsay:" + sha256(signature.encode()).hexdigest()[:20], "segments": segments,
             "transfer_count": max(0, len(bus_parts) - 1),
-            "duration_minutes": _number(path["info"]["totalTime"])}
+            "duration_minutes": _number(path["info"]["totalTime"]),
+            "total_walk_m": _optional_number(path["info"].get("totalWalk")),
+            "recommendation": None}
+
+
+def _walk_metrics(route):
+    # 총 도보거리는 ODsay 합계를 우선하고, 없으면 모든 도보 구간 거리가 있을 때만 합산한다.
+    segments = route["segments"]
+    walks = [segment.get("distance_m") for segment in segments if segment["type"] == "WALK"]
+    total = route.get("total_walk_m")
+    if total is None and all(walk is not None for walk in walks):
+        total = float(sum(walks))
+    if total is None:
+        return None
+
+    def edge(segment):
+        # 버스 구간으로 시작하거나 끝나면 해당 쪽 도보거리는 0으로 본다.
+        return 0.0 if segment["type"] == "BUS" else segment.get("distance_m")
+    access, egress = edge(segments[0]), edge(segments[-1])
+    edges = None if access is None or egress is None else access + egress
+    return {"total": total, "edges": edges}
+
+
+def _bus_signature(route):
+    return tuple((segment["bus"]["number"], segment["start"]["id"], segment["end"]["id"])
+                 for segment in route["segments"] if segment["type"] == "BUS")
+
+
+def _similar(first, second):
+    # 같은 승하차·노선 조합이거나 같은 버스 순서에 도보·시간 차이가 작으면 중복으로 본다.
+    if _bus_signature(first) == _bus_signature(second):
+        return True
+    if [s[0] for s in _bus_signature(first)] != [s[0] for s in _bus_signature(second)]:
+        return False
+    first_walk, second_walk = _walk_metrics(first), _walk_metrics(second)
+    if first_walk is None or second_walk is None:
+        return False
+    return (abs(first_walk["total"] - second_walk["total"]) < config.ROUTE_SIMILAR_WALK_M
+            and abs(first["duration_minutes"] - second["duration_minutes"]) < config.ROUTE_SIMILAR_MINUTES)
+
+
+def _recommend(routes):
+    # 후보 순서와 무관하게 최적 1·최적 2를 고르고 선택된 후보의 위치만 반환한다.
+    fastest = min(route["duration_minutes"] for route in routes)
+    fewest = min(route["transfer_count"] for route in routes)
+    known = [(index, route, _walk_metrics(route)) for index, route in enumerate(routes)]
+    known = [item for item in known if item[2] is not None]
+    acceptable = [item for item in known
+                  if item[1]["duration_minutes"] <= fastest * config.ROUTE_BEST1_MAX_TIME_RATIO
+                  and item[1]["duration_minutes"] - fastest <= config.ROUTE_BEST1_MAX_EXTRA_MINUTES
+                  and item[1]["transfer_count"] - fewest <= config.ROUTE_BEST1_MAX_EXTRA_TRANSFERS]
+    if not acceptable:
+        # 도보거리를 확인할 수 있는 후보가 없으면 최적 2 성격의 가장 빠른 경로만 추천한다.
+        index = min(range(len(routes)), key=lambda i: (routes[i]["duration_minutes"], routes[i]["transfer_count"], i))
+        routes[index]["recommendation"] = "BEST_TIME"
+        return [index]
+    best_index, best, best_walk = min(acceptable, key=lambda item: (
+        item[2]["total"] + item[1]["transfer_count"] * config.ROUTE_TRANSFER_WALK_PENALTY_M,
+        item[2]["edges"] if item[2]["edges"] is not None else float("inf"),
+        item[1]["duration_minutes"], item[0]))
+    best["recommendation"] = "BEST_WALK"
+    alternatives = []
+    for index, route, walk in known:
+        if index == best_index or _similar(best, route):
+            continue
+        if walk["total"] - best_walk["total"] > config.ROUTE_BEST2_MAX_EXTRA_WALK_M:
+            continue
+        faster = best["duration_minutes"] - route["duration_minutes"] >= config.ROUTE_BEST2_MIN_TIME_GAIN_MINUTES
+        fewer_transfers = (route["transfer_count"] < best["transfer_count"]
+                           and route["duration_minutes"] - best["duration_minutes"]
+                           <= config.ROUTE_BEST2_TRANSFER_TIME_TOLERANCE_MINUTES)
+        # 시간·환승 어느 쪽에도 실질적 이점이 없으면 최적 2로 추천하지 않는다.
+        if faster or fewer_transfers:
+            alternatives.append((route["duration_minutes"], route["transfer_count"], walk["total"], index))
+    if not alternatives:
+        return [best_index]
+    second_index = min(alternatives)[3]
+    routes[second_index]["recommendation"] = "BEST_TIME"
+    return [best_index, second_index]
 
 
 def _geometry(route, map_object, deadline):
@@ -293,6 +409,9 @@ def _geometry(route, map_object, deadline):
         for piece, bus in zip(pieces, buses):
             fields = piece.split(":")
             if len(fields) != 4 or fields[0] != bus["bus"]["id"] or fields[1] != "1":
+                return
+            # 전체 노선 형상을 승하차 구간 형상으로 표시하지 않는다.
+            if min(int(fields[2]), int(fields[3])) < 0:
                 return
         result = _odsay("loadLane", {"mapObject": "0:0@" + "@".join(pieces)}, deadline)
         lanes = result["lane"]
@@ -363,7 +482,8 @@ def _arrival(segment, city, stops, deadline):
         return {"status": "unavailable", "reason": "ROUTE_MATCH_AMBIGUOUS" if matches else "ROUTE_MATCH_NOT_FOUND"}
     start, end, route, first, last = matches[0]
     segment["start"]["tago_id"], segment["end"]["tago_id"] = start["id"], end["id"]
-    segment["bus"].update(tago_id=route["id"], direction=str(first.get("updowncd", "")) or None,
+    direction = first.get("updowncd")
+    segment["bus"].update(tago_id=route["id"], direction=None if direction in (None, "") else str(direction),
                           boarding_order=first["nodeord"], alighting_order=last["nodeord"])
 
     def load():
@@ -419,19 +539,27 @@ def find_routes(origin: dict, destination: dict) -> list[dict]:
             raise ServiceError("ROUTE_NOT_FOUND", "원주시에서 이용 가능한 버스 경로가 없습니다.", 404)
     except (KeyError, TypeError, ValueError, IndexError):
         raise _invalid("ODSAY") from None
-    # 앱이 표시하는 첫 후보에만 상세 호출을 수행하고 나머지 후보는 기본 경로를 보존한다.
-    _geometry(routes[0], paths[0]["info"]["mapObj"], deadline)
+    # 최적 1·최적 2를 앞쪽에 두어 기존처럼 첫 후보를 쓰는 앱도 최적 1을 받도록 한다.
+    selected = _recommend(routes)
+    order = selected + [index for index in range(len(routes)) if index not in selected]
+    routes, paths = [routes[index] for index in order], [paths[index] for index in order]
+    detailed = routes[:len(selected)]
+    # 앱이 표시하는 추천 후보에만 상세 호출을 수행하고 나머지 후보는 기본 경로를 보존한다.
+    for route, path in zip(detailed, paths):
+        _geometry(route, path["info"]["mapObj"], deadline)
     try:
         city = _city(deadline)
         stops = _all_stops(city, deadline)
-        for segment in routes[0]["segments"]:
-            if segment["type"] == "BUS":
-                try:
-                    segment["arrival"] = _arrival(segment, city, stops, deadline)
-                except ServiceError as exc:
-                    segment["arrival"] = {"status": "unavailable", "reason": exc.code}
+        for route in detailed:
+            for segment in route["segments"]:
+                if segment["type"] == "BUS":
+                    try:
+                        segment["arrival"] = _arrival(segment, city, stops, deadline)
+                    except ServiceError as exc:
+                        segment["arrival"] = {"status": "unavailable", "reason": exc.code}
     except ServiceError as exc:
-        for segment in routes[0]["segments"]:
-            if segment["type"] == "BUS":
-                segment["arrival"] = {"status": "unavailable", "reason": exc.code}
+        for route in detailed:
+            for segment in route["segments"]:
+                if segment["type"] == "BUS":
+                    segment["arrival"] = {"status": "unavailable", "reason": exc.code}
     return routes

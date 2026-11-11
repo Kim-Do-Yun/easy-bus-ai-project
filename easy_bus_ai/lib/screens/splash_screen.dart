@@ -69,16 +69,50 @@ class _SplashScreenState extends State<SplashScreen> {
 
   @override
   Widget build(BuildContext context) => Scaffold(
+    backgroundColor: const Color(0xFFFAF8FF),
     body: Center(
       child: Padding(
         padding: const EdgeInsets.all(24),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            // 디자인 1의 버스 로봇 로고를 벡터 그리기로 옮겨 별도 이미지 패키지 없이 표시한다.
+            const SizedBox(
+              width: 160,
+              height: 130,
+              child: CustomPaint(painter: _LogoPainter()),
+            ),
+            const SizedBox(height: 24),
             const Text(
-              '말로 타는 AI 쉬운 버스',
+              '말로 타는',
               textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+              style: TextStyle(
+                fontSize: 30,
+                fontWeight: FontWeight.w700,
+                color: Color(0xFF111827),
+                height: 1.25,
+                letterSpacing: -0.6,
+              ),
+            ),
+            const SizedBox(height: 6),
+            const Text.rich(
+              TextSpan(
+                children: [
+                  TextSpan(
+                    text: 'AI ',
+                    style: TextStyle(color: Color(0xFF2563EB)),
+                  ),
+                  TextSpan(text: '쉬운 버스'),
+                ],
+              ),
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 30,
+                fontWeight: FontWeight.w700,
+                color: Color(0xFF111827),
+                height: 1.25,
+                letterSpacing: -0.6,
+              ),
             ),
             if (_error != null) ...[
               const SizedBox(height: 24),
@@ -90,4 +124,69 @@ class _SplashScreenState extends State<SplashScreen> {
       ),
     ),
   );
+}
+
+// 디자인 1 SVG(150x130 좌표계)의 도형 순서와 색상을 그대로 따른다.
+class _LogoPainter extends CustomPainter {
+  const _LogoPainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.scale(size.height / 130);
+    Paint stroke(int color, double width, [double opacity = 1]) => Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..strokeWidth = width
+      ..color = Color(color).withValues(alpha: opacity);
+    Paint fill(int color, [double opacity = 1]) =>
+        Paint()..color = Color(color).withValues(alpha: opacity);
+    Path curve(List<double> p) {
+      final path = Path()..moveTo(p[0], p[1]);
+      for (var i = 2; i + 5 < p.length; i += 6) {
+        path.cubicTo(p[i], p[i + 1], p[i + 2], p[i + 3], p[i + 4], p[i + 5]);
+      }
+      return path;
+    }
+
+    void box(double x, double y, double w, double h, double r, Paint paint) =>
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(Rect.fromLTWH(x, y, w, h), Radius.circular(r)),
+          paint,
+        );
+
+    canvas.drawPath(curve([40, 50, 40, 22, 110, 22, 110, 50]), stroke(0xFF1E40AF, 6));
+    canvas.drawPath(
+      curve([126, 34, 132, 39, 135, 46, 135, 54, 135, 62, 132, 69, 126, 74]),
+      stroke(0xFF2563EB, 4),
+    );
+    canvas.drawPath(
+      curve([134, 26, 143, 33, 147, 43, 147, 54, 147, 65, 143, 75, 134, 82]),
+      stroke(0xFF2563EB, 4, 0.6),
+    );
+    canvas.drawPath(
+      curve([142, 18, 153, 28, 158, 40, 158, 54, 158, 68, 153, 80, 142, 90]),
+      stroke(0xFF2563EB, 3.5, 0.35),
+    );
+    box(44, 94, 14, 16, 5, fill(0xFF1E293B));
+    box(92, 94, 14, 16, 5, fill(0xFF1E293B));
+    box(40, 38, 70, 62, 22, fill(0xFF2563EB));
+    box(46, 44, 58, 32, 14, fill(0xFFFFFFFF));
+    canvas.drawPath(curve([57, 56, 57, 53, 63, 53, 63, 56]), stroke(0xFF1E293B, 3.5));
+    canvas.drawPath(curve([87, 56, 87, 53, 93, 53, 93, 56]), stroke(0xFF1E293B, 3.5));
+    canvas.drawPath(curve([70, 65, 72, 68, 78, 68, 80, 65]), stroke(0xFF1E293B, 3));
+    canvas.drawCircle(const Offset(55, 61), 3.5, fill(0xFFFCA5A5, 0.7));
+    canvas.drawCircle(const Offset(95, 61), 3.5, fill(0xFFFCA5A5, 0.7));
+    for (final x in [52.0, 98.0]) {
+      canvas.drawCircle(Offset(x, 86), 5.5, fill(0xFFFCD34D));
+      canvas.drawCircle(Offset(x, 86), 3, fill(0xFFFFFFFF));
+    }
+    box(65, 84, 20, 5, 2.5, fill(0xFF1D4ED8));
+    box(29, 48, 13, 24, 6, fill(0xFF1E3A8A));
+    box(31, 50, 9, 20, 4.5, fill(0xFF3B82F6));
+    box(108, 48, 13, 24, 6, fill(0xFF1E3A8A));
+    box(110, 50, 9, 20, 4.5, fill(0xFF3B82F6));
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }

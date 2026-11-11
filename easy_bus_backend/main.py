@@ -1,8 +1,8 @@
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from api.routes import router
-from services.location_service import ServiceError
+from easy_bus_backend.api.routes import router
+from easy_bus_backend.services.location_service import ServiceError
 
 # AI 쉬운 버스 백엔드 서버
 app = FastAPI(
@@ -28,3 +28,14 @@ def health_check():
         "status": "ok",
         "message": "Easy AI Bus 서버 정상 실행"
     }
+
+# 서버 실행 설정
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "easy_bus_backend.main:app",
+        host="0.0.0.0",
+        port=8080,
+        reload=True
+    )
