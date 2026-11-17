@@ -8,7 +8,9 @@ import '../models/bus_models.dart';
 
 class ApiException implements Exception {
   final String message;
-  ApiException(this.message);
+  // 서버 오류 코드이며 음성 재질문 대상인지 구분하는 데만 사용한다.
+  final String? code;
+  ApiException(this.message, [this.code]);
   @override
   String toString() => message;
 }
@@ -36,6 +38,7 @@ class ApiService {
           detail is Map
               ? detail['message'].toString()
               : '요청을 처리할 수 없습니다. (${response.statusCode})',
+          detail is Map ? detail['code']?.toString() : null,
         );
       }
       return body;
@@ -69,8 +72,14 @@ class ApiService {
     return (await _send(request))['text'] as String;
   }
 
-  Future<Interpretation> interpret(String text) async =>
-      Interpretation.fromJson(await _post('/interpret', {'text': text}));
+  // 다중 턴 대화에서는 직전에 물은 항목(origin, destination)을 함께 전달한다.
+  Future<Interpretation> interpret(String text, {String? expectedSlot}) async =>
+      Interpretation.fromJson(
+        await _post('/interpret', {
+          'text': text,
+          'expected_slot': ?expectedSlot,
+        }),
+      );
   Future<List<Place>> locations(String query) async =>
       ((await _get('/locations/search', {'q': query})) as List)
           .map((j) => Place.fromJson(j))

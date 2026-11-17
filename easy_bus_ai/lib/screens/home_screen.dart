@@ -66,6 +66,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int _request = 0;
   bool _loading = false;
   bool _audioTransition = false;
+  // 음성 대화 상태이며 출발지·목적지 값 자체는 기존 입력창과 확정 장소를 그대로 사용한다.
+  // 진행 중 여부, 직전에 물은 항목(origin·destination·both), 재질문 횟수, 현재 위치 출발 여부를 둔다.
+  bool _voiceActive = false;
+  String? _awaitingSlot;
+  int _voiceRetries = 0;
+  bool _voiceCurrentLocation = false;
+  static const _maxVoiceRetries = 3;
+  // 말소리를 인식하지 못한 서버 오류 코드이며 재질문 횟수에 포함한다.
+  static const _speechRetryCodes = {
+    'EMPTY_AUDIO',
+    'EMPTY_SPEECH',
+    'SPEECH_FAILED',
+    'INVALID_AUDIO',
+    'AUDIO_DURATION',
+  };
   Timer? _loadingTimer, _recordTimer;
   final List<NOverlayInfo> _routeOverlays = [];
   Future<void> _mapQueue = Future.value();
@@ -332,36 +347,33 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       var originName = _origin.text.trim();
       var destinationName = _destination.text.trim();
       if (audioPath != null) {
-        final text = await _api.speech(audioPath);
-        if (!_valid(id)) return;
-        final interpretation = await _api.interpret(text);
-        if (!_valid(id)) return;
-        if (interpretation.needsClarification)
-          throw Exception(
-            interpretation.clarificationMessage ?? '목적지를 자세히 말씀해 주세요.',
-          );
-        originName = interpretation.useCurrentLocation
-            ? '현재 위치'
-            : interpretation.origin ?? '';
-        destinationName = interpretation.destination ?? '';
-        // 음성으로 현재 위치를 선택한 경우에도 안내 문구를 입력값으로 넣지 않는다.
-        _origin.text = originName == '현재 위치' ? '' : originName;
-        _destination.text = destinationName;
+        // 출발지·목적지가 모두 확인될 때까지는 재질문만 하고 경로 검색으로 넘어가지 않는다.
+        if (!await _voiceTurn(audioPath, id) || !_valid(id)) return;
+        originName = _origin.text.trim();
+        destinationName = _destination.text.trim();
       }
       if (destinationName.isEmpty) throw Exception('목적지를 입력해 주세요.');
       // 후보 목록에서 이미 확정한 장소는 다시 검색하지 않고 저장한 좌표를 그대로 사용한다.
       final originPlace = _originPlace, destinationPlace = _destinationPlace;
+      final voice = audioPath != null;
       final origin = originName.isEmpty || originName == '현재 위치'
-          ? await _device.currentPosition()
+          ? await _currentOrigin(id, voice)
           : originPlace != null && originPlace.name == originName
           ? originPlace
-          : await _resolve(originName, id, '출발지');
+          : await _resolvePlace(originName, id, true, voice);
       if (!_valid(id) || origin == null) return;
       final destination =
           destinationPlace != null && destinationPlace.name == destinationName
           ? destinationPlace
-          : await _resolve(destinationName, id, '목적지');
+          : await _resolvePlace(destinationName, id, false, voice);
       if (!_valid(id) || destination == null) return;
+      if (voice) {
+        try {
+          await _device.speak('버스 경로를 찾고 있습니다.');
+        } catch (_) {
+          /* 시작 안내 실패는 경로 검색을 막지 않는다. */
+        }
+      }
       final routes = await _api.routes(origin, destination);
       if (!_valid(id)) return;
       if (routes.isEmpty || routes.first.segments.isEmpty)
@@ -385,6 +397,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         },
       );
       if (!_valid(id)) return;
+      // 경로를 받으면 음성 대화를 마치고 다음 음성 입력은 새 경로 요청으로 본다.
+      _resetVoice();
       // 검색 버튼에서 바로 고른 장소도 확정해 두어 뒤로 가기 후 다시 검색할 때 재조회하지 않는다.
       // 경로 화면 맞춤을 유지하도록 카메라는 움직이지 않으며 선택 마커는 경로를 지울 때 보인다.
       try {
@@ -405,6 +419,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (_valid(id)) {
         _notice(error);
         setState(() => _phase = HomePhase.attention);
+        // 음성으로 요청한 경우 실패 안내도 기존 TTS로 들려준다.
+        if (audioPath != null) {
+          try {
+            await _device.speak(
+              error.toString().replaceFirst('Exception: ', ''),
+            );
+          } catch (_) {
+            /* 실패 안내 재생 오류는 화면 안내로 대신한다. */
+          }
+        }
       }
     } finally {
       if (audioPath != null) {
@@ -422,6 +446,130 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             _phase = _route == null ? HomePhase.map : HomePhase.guidance;
         });
       }
+    }
+  }
+
+  // 음성 한 번을 인식·해석하여 기존 출발지·목적지와 합치고, 빠진 장소가 있으면 재질문한 뒤 false를 반환한다.
+  Future<bool> _voiceTurn(String audioPath, int id) async {
+    final String text;
+    try {
+      text = await _api.speech(audioPath);
+    } on ApiException catch (error) {
+      if (!_valid(id) || !_speechRetryCodes.contains(error.code)) rethrow;
+      await _askAgain(error.message);
+      return false;
+    }
+    if (!_valid(id)) return false;
+    final Interpretation result;
+    try {
+      result = await _api.interpret(
+        text,
+        expectedSlot: _awaitingSlot == 'both' ? null : _awaitingSlot,
+      );
+    } on ApiException catch (error) {
+      if (!_valid(id) || error.code != 'INVALID_AI_RESPONSE') rethrow;
+      await _askAgain('어디에서 어디로 가시는지 다시 말씀해 주세요.', heard: text);
+      return false;
+    }
+    if (!_valid(id)) return false;
+    // 이전 경로를 보는 중에 시작한 새 요청이면 이전 장소를 비우고, 진행 중인 대화나 직접 입력한 값은 유지한다.
+    if (!_voiceActive && _route != null) {
+      _origin.text = '';
+      _destination.text = '';
+      _voiceCurrentLocation = false;
+    }
+    _voiceActive = true;
+    // 이번 발화에서 말한 항목만 갱신하고, 말하지 않은 항목과 확정 장소는 그대로 둔다.
+    if (result.useCurrentLocation) {
+      _origin.text = '';
+      _voiceCurrentLocation = true;
+    } else if (result.origin != null) {
+      _origin.text = result.origin!;
+      _voiceCurrentLocation = false;
+    }
+    if (result.destination != null) _destination.text = result.destination!;
+    final hasOrigin = _voiceCurrentLocation || _origin.text.trim().isNotEmpty;
+    final hasDestination = _destination.text.trim().isNotEmpty;
+    if (hasOrigin && hasDestination) {
+      _awaitingSlot = null;
+      return true;
+    }
+    final slot = !hasOrigin && !hasDestination
+        ? 'both'
+        : !hasOrigin
+        ? 'origin'
+        : 'destination';
+    await _askAgain(
+      slot == 'both'
+          ? '어디에서 어디로 가시는지 말씀해 주세요.'
+          : slot == 'origin'
+          ? '어디에서 출발하시나요?'
+          : '어디로 가시나요?',
+      slot: slot,
+      heard: text,
+    );
+    return false;
+  }
+
+  // 재질문은 화면 안내와 TTS로 함께 전달하고, 최대 횟수를 넘으면 직접 입력으로 안내한다.
+  Future<void> _askAgain(String question, {String? slot, String? heard}) async {
+    var message = question;
+    if (++_voiceRetries > _maxVoiceRetries) {
+      // 이미 확인한 장소는 입력창에 남겨 두고 대화 상태만 초기화한다.
+      _resetVoice();
+      message = '음성으로 장소를 확인하지 못했습니다. 입력창에 출발지와 목적지를 직접 입력하거나 검색해 주세요.';
+    } else if (slot != null) {
+      _awaitingSlot = slot;
+    }
+    _notice(heard == null ? message : '"$heard"\n$message');
+    try {
+      await _device.speak(message);
+    } catch (_) {
+      /* 재질문 음성 재생 실패는 화면 안내로 대신한다. */
+    }
+  }
+
+  void _resetVoice() {
+    _voiceActive = false;
+    _awaitingSlot = null;
+    _voiceRetries = 0;
+    _voiceCurrentLocation = false;
+  }
+
+  // 음성 대화에서 현재 위치를 확인하지 못하면 임의 좌표 없이 출발지를 다시 묻는다.
+  Future<Place?> _currentOrigin(int id, bool voice) async {
+    if (!voice) return _device.currentPosition();
+    try {
+      return await _device.currentPosition();
+    } catch (_) {
+      if (!_valid(id)) return null;
+      _voiceCurrentLocation = false;
+      await _askAgain('현재 위치를 확인하지 못했습니다. 어디에서 출발하시나요?', slot: 'origin');
+      return null;
+    }
+  }
+
+  // 음성 대화에서 장소를 찾지 못하면 해당 항목만 비우고 다시 물으며 다른 항목은 유지한다.
+  Future<Place?> _resolvePlace(
+    String name,
+    int id,
+    bool isOrigin,
+    bool voice,
+  ) async {
+    final label = isOrigin ? '출발지' : '목적지';
+    if (!voice) return _resolve(name, id, label);
+    try {
+      return await _resolve(name, id, label);
+    } on ApiException {
+      rethrow;
+    } catch (_) {
+      if (!_valid(id)) return null;
+      (isOrigin ? _origin : _destination).text = '';
+      await _askAgain(
+        '$name 장소를 찾지 못했습니다. $label 이름을 다시 말씀해 주세요.',
+        slot: isOrigin ? 'origin' : 'destination',
+      );
+      return null;
     }
   }
 

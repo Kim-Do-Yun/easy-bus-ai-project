@@ -77,7 +77,7 @@ def _merge_places(places: list[dict]) -> list[dict]:
 
 
 def _local_search(query: str) -> list[dict]:
-    # 네이버 개발자센터 지역 검색 API는 서버에서만 호출하여 Client Secret이 앱에 포함되지 않게 한다.
+    # NAVER API HUB 지역 검색 API는 서버에서만 호출하여 Client Secret이 앱에 포함되지 않게 한다.
     if not config.NAVER_SEARCH_CLIENT_ID.strip() or not config.NAVER_SEARCH_CLIENT_SECRET.strip():
         raise ServiceError("NAVER_SEARCH_CONFIG_MISSING", "네이버 장소 검색 API 인증정보를 설정해 주세요.")
     deadline = monotonic() + config.TRANSIT_REQUEST_SECONDS
@@ -91,14 +91,19 @@ def _local_search(query: str) -> list[dict]:
 
 def _local_items(text: str, deadline: float) -> list[dict]:
     try:
-        result = request_json("NAVER_SEARCH", "https://openapi.naver.com/v1/search/local.json",
-                              {"query": text, "display": 5, "start": 1, "sort": "random"}, deadline,
-                              headers={"X-Naver-Client-Id": config.NAVER_SEARCH_CLIENT_ID.strip(),
-                                       "X-Naver-Client-Secret": config.NAVER_SEARCH_CLIENT_SECRET.strip()})
+        # API HUB 개발 가이드의 지역 검색 경로와 NCP API Gateway 공통 인증 헤더를 사용한다.
+        result = request_json("NAVER_SEARCH", "https://naverapihub.apigw.ntruss.com/search/v1/local",
+                              {"query": text, "display": 5, "start": 1, "sort": "random", "format": "json"},
+                              deadline,
+                              headers={"X-NCP-APIGW-API-KEY-ID": config.NAVER_SEARCH_CLIENT_ID.strip(),
+                                       "X-NCP-APIGW-API-KEY": config.NAVER_SEARCH_CLIENT_SECRET.strip()})
     except ServiceError as exc:
         # 공급자 코드명 대신 사용자가 이해할 수 있는 안내로 바꾸고 오류 코드는 유지한다.
-        if exc.code in ("NAVER_SEARCH_AUTH_FAILED", "NAVER_SEARCH_HTTP_ERROR"):
-            raise ServiceError(exc.code, "네이버 장소 검색 API 인증 또는 검색 API 사용 설정을 확인해 주세요.", exc.status) from None
+        if exc.code == "NAVER_SEARCH_AUTH_FAILED":
+            # 401은 인증 실패, 403은 애플리케이션에 지역 검색 API가 선택되지 않은 경우 등 호출 불허이다.
+            raise ServiceError(exc.code, "네이버 장소 검색 인증에 실패했습니다. API HUB의 Client ID·Secret과 지역 검색 API 선택 여부를 확인해 주세요.", exc.status) from None
+        if exc.code == "NAVER_SEARCH_HTTP_ERROR":
+            raise ServiceError(exc.code, "네이버 장소 검색 요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.", exc.status) from None
         if exc.code == "NAVER_SEARCH_QUOTA_EXCEEDED":
             raise ServiceError(exc.code, "네이버 장소 검색 호출 한도를 초과했습니다. 잠시 후 다시 시도해 주세요.", 429) from None
         if exc.code == "NAVER_SEARCH_TIMEOUT":
@@ -113,18 +118,28 @@ def _local_items(text: str, deadline: float) -> list[dict]:
             # 제목의 강조 태그와 HTML 문자를 제거한 장소명만 사용한다.
             name = unescape(re.sub(r"<[^>]+>", "", str(item["title"]))).strip()
             address = str(item.get("roadAddress") or item.get("address") or "").strip() or None
-            # 지역 검색 좌표는 WGS84 경위도에 10^7을 곱한 값이며 mapx가 경도, mapy가 위도이다.
-            longitude, latitude = float(item["mapx"]) / 1e7, float(item["mapy"]) / 1e7
+            # 지역 검색 좌표는 WGS84 기준이며 mapx가 경도, mapy가 위도이다.
+            longitude, latitude = _local_coordinate(item["mapx"], item["mapy"])
             validate_coordinate(latitude, longitude)
         except (KeyError, TypeError, ValueError, ServiceError):
             continue
-        # 국내 범위를 벗어난 좌표는 다른 좌표체계로 보고 선택 가능한 후보에서 제외한다.
-        if not name or not (33 <= latitude <= 39 and 124 <= longitude <= 132):
+        if not name:
             continue
         places.append({"id": "naver_local:" + sha256(f"{name}|{address}".encode()).hexdigest()[:20],
                        "name": name, "address": address, "kind": "PLACE",
                        "latitude": latitude, "longitude": longitude})
     return places
+
+
+def _local_coordinate(mapx, mapy) -> tuple[float, float]:
+    # 문서 예시가 자리표시자뿐이라 경위도 그대로인지 10^7을 곱한 정수인지 확정하지 않고,
+    # 두 표기 중 국내 범위에 드는 값만 사용하며 둘 다 아니면 선택 후보에서 제외한다.
+    x, y = float(mapx), float(mapy)
+    for scale in (1, 1e7):
+        longitude, latitude = x / scale, y / scale
+        if 124 <= longitude <= 132 and 33 <= latitude <= 39:
+            return longitude, latitude
+    raise ValueError()
 
 
 def _geocode(query: str) -> list[dict]:

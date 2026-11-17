@@ -17,6 +17,8 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:1.7b")
 AI_TIMEOUT = float(os.getenv("AI_TIMEOUT", "120"))
 WHISPER_PATH = data_path("WHISPER_PATH", "models/whisper/small")
+# 로컬 폴더에 모델이 없으면 이미 내려받은 캐시의 모델명을 사용하며 새로 내려받지 않는다.
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 STOPS_PATH = data_path("STOPS_PATH", "data/processed/stops.json")
@@ -27,7 +29,7 @@ MAX_AUDIO_SECONDS = int(os.getenv("MAX_AUDIO_SECONDS", "60"))
 # 서버 API 인증정보는 앱용 지도 Client ID와 분리하고, 미설정 상태도 허용한다.
 NAVER_API_KEY_ID = os.getenv("NAVER_API_KEY_ID", "")
 NAVER_API_KEY = os.getenv("NAVER_API_KEY", "")
-# 장소명 검색은 네이버 개발자센터 지역 검색 API 인증정보를 별도로 사용한다.
+# 장소명 검색은 NAVER API HUB 애플리케이션의 Client ID·Secret을 별도로 사용한다.
 NAVER_SEARCH_CLIENT_ID = os.getenv("NAVER_SEARCH_CLIENT_ID", "")
 NAVER_SEARCH_CLIENT_SECRET = os.getenv("NAVER_SEARCH_CLIENT_SECRET", "")
 ODSAY_API_KEY = os.getenv("ODSAY_API_KEY", "")

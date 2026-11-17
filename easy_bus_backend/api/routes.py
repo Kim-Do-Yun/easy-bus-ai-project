@@ -90,11 +90,13 @@ class RouteRequest(BaseModel):
 
 class InterpretRequest(BaseModel):
     text: str = Field(min_length=1, max_length=1000, pattern=r"\S")
+    # 다중 턴 대화에서 앱이 직전에 물은 항목이며 기존 요청처럼 생략할 수 있다.
+    expected_slot: Literal["origin", "destination"] | None = None
 
 
 @router.post("/interpret", response_model=ai_service.Interpretation)
 async def interpret(request: InterpretRequest):
-    return await ai_service.interpret(request.text)
+    return await ai_service.interpret(request.text, request.expected_slot)
 
 
 @router.post("/speech")
