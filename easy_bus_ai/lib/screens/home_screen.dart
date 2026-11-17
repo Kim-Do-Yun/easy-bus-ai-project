@@ -52,6 +52,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // 출발지가 비어 있으면 안내 문구를 표시하고 기존 GPS 분기를 사용한다.
   final _origin = TextEditingController();
   final _destination = TextEditingController();
+  // 후보 목록에서 확정한 출발지·목적지와 선택 마커이며 입력 문구가 바뀌면 확정을 해제한다.
+  Place? _originPlace, _destinationPlace;
+  NMarker? _originMarker, _destinationMarker;
   NaverMapController? _map;
   HomePhase _phase = HomePhase.map;
   BusRoute? _route;
@@ -78,6 +81,122 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _initElapsed.start();
     debugPrint('[EASY_BUS_INIT] HomeScreen initState 진입 (화면=${_initElapsed.elapsedMilliseconds}ms)');
     WidgetsBinding.instance.addObserver(this);
+    _origin.addListener(() => _releaseSelection(true));
+    _destination.addListener(() => _releaseSelection(false));
+  }
+
+  // 확정한 장소명과 입력 문구가 달라지면 이전 좌표와 선택 마커를 쓰지 않는다.
+  void _releaseSelection(bool isOrigin) {
+    final place = isOrigin ? _originPlace : _destinationPlace;
+    final text = (isOrigin ? _origin : _destination).text.trim();
+    if (place == null || place.name == text) return;
+    if (isOrigin) {
+      _originPlace = null;
+    } else {
+      _destinationPlace = null;
+    }
+    _removeSelectionMarker(isOrigin);
+  }
+
+  void _removeSelectionMarker(bool isOrigin) {
+    final marker = isOrigin ? _originMarker : _destinationMarker;
+    if (marker == null) return;
+    if (isOrigin) {
+      _originMarker = null;
+    } else {
+      _destinationMarker = null;
+    }
+    // 기존 지도 큐를 사용하여 경로 오버레이 변경과 순서가 섞이지 않게 한다.
+    final task = _mapQueue.then((_) async {
+      if (!mounted || _map == null) return;
+      await _map!.deleteOverlay(marker.info);
+    });
+    _mapQueue = task.catchError((Object error) {});
+  }
+
+  // 경로를 표시하는 동안에는 경로의 출발·도착 마커와 겹치지 않도록 선택 마커를 숨긴다.
+  void _showSelectionMarkers(bool visible) {
+    _originMarker?.setIsVisible(visible);
+    _destinationMarker?.setIsVisible(visible);
+  }
+
+  // 선택한 장소의 좌표를 확정하고, 입력창 문구·선택 마커·지도 카메라를 갱신한다. 경로 검색은 하지 않는다.
+  Future<void> _confirmPlace(
+    Place place,
+    bool isOrigin, {
+    bool moveCamera = true,
+  }) async {
+    if (isOrigin) {
+      _originPlace = place;
+    } else {
+      _destinationPlace = place;
+    }
+    // 확정 장소를 먼저 저장해 두어 문구 변경 감지에서 해제되지 않게 한다.
+    (isOrigin ? _origin : _destination).text = place.name;
+    _removeSelectionMarker(isOrigin);
+    final marker = NMarker(
+      id: isOrigin ? 'select_origin' : 'select_destination',
+      position: _latLng(place),
+      iconTintColor: isOrigin
+          ? EasyColors.primaryContainer
+          : EasyColors.tertiaryContainer,
+      caption: NOverlayCaption(
+        text: isOrigin ? '출발지' : '도착지',
+        textSize: 15,
+        color: EasyColors.onSurface,
+      ),
+      subCaption: NOverlayCaption(
+        text: place.name,
+        textSize: 13,
+        color: EasyColors.onSurfaceVariant,
+      ),
+    );
+    if (isOrigin) {
+      _originMarker = marker;
+    } else {
+      _destinationMarker = marker;
+    }
+    final task = _mapQueue.then((_) async {
+      if (!mounted || _map == null) return;
+      // 그 사이 다른 장소가 선택되었으면 오래된 마커를 추가하지 않는다.
+      if (!identical(isOrigin ? _originMarker : _destinationMarker, marker))
+        return;
+      await _map!.addOverlay(marker);
+      if (_route != null) marker.setIsVisible(false);
+      if (!moveCamera) return;
+      await _map!.updateCamera(
+        NCameraUpdate.scrollAndZoomTo(target: _latLng(place), zoom: 16),
+      );
+    });
+    _mapQueue = task.catchError((Object error) {});
+    await task;
+  }
+
+  // 입력창에서 검색 키를 누르면 후보를 찾아 선택만 하고, 경로 검색은 출발지·목적지 확정 후 수행한다.
+  Future<void> _pickPlace(bool isOrigin) async {
+    if (_busy || _phase == HomePhase.recording) return;
+    final text = (isOrigin ? _origin : _destination).text.trim();
+    // 출발지를 비우면 기존 GPS 출발 분기를 그대로 사용한다.
+    if (text.isEmpty) {
+      if (!isOrigin) _notice('목적지를 입력해 주세요.');
+      return;
+    }
+    final id = _begin();
+    try {
+      final place = await _resolve(text, id, isOrigin ? '출발지' : '목적지');
+      if (!_valid(id) || place == null) return;
+      await _confirmPlace(place, isOrigin);
+    } catch (error) {
+      if (_valid(id)) _notice(error);
+    } finally {
+      if (_valid(id)) {
+        _loadingTimer?.cancel();
+        setState(() {
+          _loading = false;
+          _phase = _route == null ? HomePhase.map : HomePhase.guidance;
+        });
+      }
+    }
   }
 
   void _notice(Object error) {
@@ -185,7 +304,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         (p) => ListTile(
                           minVerticalPadding: 16,
                           title: Text(p.name),
-                          subtitle: Text('${p.latitude}, ${p.longitude}'),
+                          // 장소 구분과 주소(정류장은 정류장 번호)를 표시하고, 둘 다 없으면 기존처럼 좌표를 보여 준다.
+                          subtitle: Text(
+                            p.tagoId != null || p.kind == 'STOP'
+                                ? '버스 정류장${p.arsId != null ? ' · 정류장 번호 ${p.arsId}' : ''}'
+                                : p.address != null
+                                ? '${p.kind == 'PLACE' ? '장소' : '주소'} · ${p.address}'
+                                : '${p.latitude}, ${p.longitude}',
+                          ),
                           onTap: () => Navigator.pop(context, p),
                         ),
                       )
@@ -223,11 +349,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _destination.text = destinationName;
       }
       if (destinationName.isEmpty) throw Exception('목적지를 입력해 주세요.');
+      // 후보 목록에서 이미 확정한 장소는 다시 검색하지 않고 저장한 좌표를 그대로 사용한다.
+      final originPlace = _originPlace, destinationPlace = _destinationPlace;
       final origin = originName.isEmpty || originName == '현재 위치'
           ? await _device.currentPosition()
+          : originPlace != null && originPlace.name == originName
+          ? originPlace
           : await _resolve(originName, id, '출발지');
       if (!_valid(id) || origin == null) return;
-      final destination = await _resolve(destinationName, id, '목적지');
+      final destination =
+          destinationPlace != null && destinationPlace.name == destinationName
+          ? destinationPlace
+          : await _resolve(destinationName, id, '목적지');
       if (!_valid(id) || destination == null) return;
       final routes = await _api.routes(origin, destination);
       if (!_valid(id)) return;
@@ -251,6 +384,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           _destinationLabel = destination.name;
         },
       );
+      if (!_valid(id)) return;
+      // 검색 버튼에서 바로 고른 장소도 확정해 두어 뒤로 가기 후 다시 검색할 때 재조회하지 않는다.
+      // 경로 화면 맞춤을 유지하도록 카메라는 움직이지 않으며 선택 마커는 경로를 지울 때 보인다.
+      try {
+        if (origin.id != 'current' && !identical(origin, _originPlace))
+          await _confirmPlace(origin, true, moveCamera: false);
+        if (!identical(destination, _destinationPlace))
+          await _confirmPlace(destination, false, moveCamera: false);
+      } catch (_) {
+        /* 선택 마커 표시 실패는 경로 결과를 바꾸지 않는다. */
+      }
       if (!_valid(id)) return;
       try {
         await _device.speak(result.guidance);
@@ -374,20 +518,29 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             '도착',
             EasyColors.tertiaryContainer,
           );
+        // 환승 지점은 첫 승차·마지막 하차와 구분되도록 표시 문구만 바꾼다.
+        final busIndexes = [
+          for (var i = 0; i < segments.length; i++)
+            if (segments[i].type == 'BUS') i,
+        ];
         for (var i = 0; i < segments.length; i++) {
           final segment = segments[i];
           if (segment.type == 'BUS') {
+            final transferIn = i != busIndexes.first;
+            final transferOut = i != busIndexes.last;
             await marker(
               '${i}_start',
               segment.start,
-              '${segment.bus?.number ?? ''}번 승차',
+              transferIn
+                  ? '환승 ${segment.bus?.number ?? ''}번 승차'
+                  : '${segment.bus?.number ?? ''}번 승차',
               accent,
               segment.start.name,
             );
             await marker(
               '${i}_end',
               segment.end,
-              '하차',
+              transferOut ? '하차 후 환승' : '하차',
               EasyColors.tertiary,
               segment.end.name,
             );
@@ -460,6 +613,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           _route = route;
           commit?.call();
         });
+        _showSelectionMarkers(false);
         for (final info in previous) {
           try {
             await _map!.deleteOverlay(info);
@@ -642,6 +796,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         await _map!.deleteOverlay(info);
       }
       _routeOverlays.clear();
+      // 경로를 지운 뒤에는 확정해 둔 출발지·목적지 선택 마커를 다시 보여 준다.
+      _showSelectionMarkers(true);
     });
     _mapQueue = task.catchError((Object error) {
       _notice(error);
@@ -881,6 +1037,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ),
               hint: '출발지를 입력하세요',
               action: TextInputAction.next,
+              // 출발지 입력을 마치면 후보를 골라 지도에서 위치를 확인한다.
+              onSubmitted: (_) => _pickPlace(true),
               trailing: const Tooltip(
                 message: '비워 두면 현재 위치에서 출발합니다',
                 child: Padding(
@@ -907,7 +1065,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
         hint: '도착지를 입력하세요',
         action: TextInputAction.search,
-        onSubmitted: (_) => _search(),
+        // 목적지가 확정되지 않았으면 먼저 후보를 골라 위치를 확인하고, 확정된 뒤에는 기존 경로 검색을 수행한다.
+        onSubmitted: (_) =>
+            _destinationPlace != null &&
+                _destinationPlace!.name == _destination.text.trim()
+            ? _search()
+            : _pickPlace(false),
         trailing: IconButton(
           onPressed: _busy || _phase == HomePhase.recording
               ? null

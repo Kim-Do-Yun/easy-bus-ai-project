@@ -20,6 +20,31 @@ class BusDetailScreen extends StatelessWidget {
   static List<Place> _stopsOf(RouteSegment segment) =>
       segment.stops.length >= 2 ? segment.stops : [segment.start, segment.end];
 
+  // 버스 구간 앞뒤의 도보 구간이며 실제 응답에 있는 경우에만 거리·시간을 안내한다.
+  RouteSegment? _walkNear(RouteSegment segment, int offset) {
+    final index = route.segments.indexOf(segment) + offset;
+    if (index < 0 || index >= route.segments.length) return null;
+    final walk = route.segments[index];
+    return walk.type == 'WALK' ? walk : null;
+  }
+
+  String _summary() {
+    final walkM = route.totalWalkM, walkMinutes = route.totalWalkMinutes;
+    final walk = [
+      if (walkM != null)
+        walkM >= 1000
+            ? '${(walkM / 1000).toStringAsFixed(1)}km'
+            : '${walkM.round()}m',
+      if (walkMinutes != null) '약 ${walkMinutes.round()}분',
+    ];
+    return [
+      if (route.durationMinutes != null)
+        '총 약 ${route.durationMinutes!.round()}분',
+      if (walk.isNotEmpty) '도보 ${walk.join(' ')}',
+      route.transferCount == 0 ? '환승 없음' : '환승 ${route.transferCount}회',
+    ].join(' · ');
+  }
+
   String _arrivalText(BusArrival arrival) => arrival.available
       ? '약 ${arrival.minutes}분 후'
       : '도착정보 없음';
@@ -144,6 +169,17 @@ class BusDetailScreen extends StatelessWidget {
                               color: EasyColors.onSurfaceVariant,
                             ),
                           ),
+                          // 전체 소요시간·도보·환승은 ODsay 응답 값만 같은 글자 형식으로 덧붙인다.
+                          Text(
+                            _summary(),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w600,
+                              color: EasyColors.onSurfaceVariant,
+                            ),
+                          ),
                         ],
                       ),
                     ),
@@ -248,7 +284,7 @@ class BusDetailScreen extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           for (var k = 0; k < stops.length; k++)
-            _stopRow(segment, stops, k, index),
+            _stopRow(segment, stops, k, index, count),
           if (!hasList)
             const Padding(
               padding: EdgeInsets.only(top: 8),
@@ -271,6 +307,7 @@ class BusDetailScreen extends StatelessWidget {
     List<Place> stops,
     int k,
     int segmentIndex,
+    int count,
   ) {
     final stop = stops[k];
     final boarding = k == 0, alighting = k == stops.length - 1;
@@ -298,10 +335,34 @@ class BusDetailScreen extends StatelessWidget {
         : k == 1 && !alighting
         ? '다음'
         : '$k정류장 후';
+    // 환승 도보는 앞 구간 하차 줄에만 표시하여 같은 안내가 반복되지 않게 한다.
+    final before = boarding && segmentIndex == 0
+        ? _walkNear(segment, -1)?.walkText
+        : null;
+    final after = alighting ? _walkNear(segment, 1)?.walkText : null;
     final details = [
       if (stop.arsId != null) '정류장 번호 ${stop.arsId}',
+      // 첫 승차 버스의 남은 정류장 수와 미제공 사유는 TAGO 응답이 있을 때만 표시한다.
+      if (boarding &&
+          segmentIndex == 0 &&
+          segment.arrival.available &&
+          segment.arrival.remainingStops != null)
+        '${segment.arrival.remainingStops}정류장 전',
+      if (boarding &&
+          segmentIndex == 0 &&
+          segment.arrival.available &&
+          segment.arrival.nextMinutes != null)
+        '다음 버스 약 ${segment.arrival.nextMinutes}분 후${segment.arrival.nextRemainingStops != null ? '(${segment.arrival.nextRemainingStops}정류장 전)' : ''}',
+      if (boarding && segmentIndex == 0 && segment.arrival.unavailableReason != null)
+        segment.arrival.unavailableReason!,
+      if (before != null) '출발지에서 $before',
       if (alighting && segment.durationMinutes != null)
         '약 ${segment.durationMinutes!.round()}분 소요',
+      if (after != null)
+        segmentIndex == count - 1 ? '하차 후 목적지까지 $after' : '하차 후 환승 $after',
+      // 환승 구간이면 다음 버스의 노선번호와 승차 정류장을 함께 안내한다.
+      if (alighting && segmentIndex < count - 1)
+        '${route.busSegments[segmentIndex + 1].start.name}에서 ${route.busSegments[segmentIndex + 1].bus?.number ?? ''}번 버스로 환승',
     ];
     const line = EasyColors.surfaceContainerHighest;
     return IntrinsicHeight(

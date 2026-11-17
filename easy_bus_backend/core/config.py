@@ -27,6 +27,9 @@ MAX_AUDIO_SECONDS = int(os.getenv("MAX_AUDIO_SECONDS", "60"))
 # 서버 API 인증정보는 앱용 지도 Client ID와 분리하고, 미설정 상태도 허용한다.
 NAVER_API_KEY_ID = os.getenv("NAVER_API_KEY_ID", "")
 NAVER_API_KEY = os.getenv("NAVER_API_KEY", "")
+# 장소명 검색은 네이버 개발자센터 지역 검색 API 인증정보를 별도로 사용한다.
+NAVER_SEARCH_CLIENT_ID = os.getenv("NAVER_SEARCH_CLIENT_ID", "")
+NAVER_SEARCH_CLIENT_SECRET = os.getenv("NAVER_SEARCH_CLIENT_SECRET", "")
 ODSAY_API_KEY = os.getenv("ODSAY_API_KEY", "")
 TAGO_SERVICE_KEY = os.getenv("TAGO_SERVICE_KEY", "")
 # 도시코드는 실제 원주시 코드를 확인한 뒤 입력하며 임의로 추정하지 않는다.

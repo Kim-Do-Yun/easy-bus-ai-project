@@ -27,6 +27,8 @@ class Place(Coordinate):
     tago_id: str | None = None
     # 정류장에 표기된 번호이며 ODsay가 제공한 경우에만 채운다.
     ars_id: str | None = None
+    # 장소 검색 후보의 구분(PLACE 장소명, ADDRESS 주소, STOP 정류장)이며 경로 응답에서는 비워 둔다.
+    kind: str | None = None
 
 
 class Stop(Place):
@@ -51,6 +53,9 @@ class Arrival(BaseModel):
     remaining_stops: int | None = None
     observed_at: str | None = None
     reason: str | None = None
+    # 같은 노선의 두 번째 도착 예정 차량이며 TAGO 응답에 있을 때만 채운다.
+    next_minutes: int | None = None
+    next_remaining_stops: int | None = None
 
 
 class Segment(BaseModel):

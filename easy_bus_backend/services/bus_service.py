@@ -124,8 +124,9 @@ def _all_stops(city, deadline):
             for row in rows:
                 latitude, longitude = float(row["gpslati"]), float(row["gpslong"])
                 validate_coordinate(latitude, longitude)
+                # 정류장 번호(nodeno)는 TAGO가 제공한 경우에만 채운다.
                 stop = {"id": _text(row["nodeid"]), "name": _text(row["nodenm"]),
-                        "latitude": latitude, "longitude": longitude}
+                        "latitude": latitude, "longitude": longitude, "ars_id": _ars_id(row.get("nodeno"))}
                 if stop["id"] in stops and stops[stop["id"]] != stop:
                     raise ValueError()
                 stops[stop["id"]] = stop
@@ -156,6 +157,34 @@ def nearby_stops(latitude: float, longitude: float, radius_m: float) -> list[dic
         if distance <= radius_m:
             result.append({**stop, "distance_m": round(distance, 1)})
     return sorted(result, key=lambda stop: (stop["distance_m"], stop["id"]))
+
+
+def search_stop_places(query: str) -> list[dict]:
+    # 장소명 검색 API가 없으므로 TAGO 원주시 정류장 이름에 검색어가 포함된 실제 정류장만 후보로 쓴다.
+    keyword = "".join(query.split())
+    for suffix in ("정류장", "정류소"):
+        if keyword.endswith(suffix) and len(keyword) > len(suffix):
+            keyword = keyword[:-len(suffix)]
+    if not keyword:
+        return []
+    deadline = monotonic() + config.TRANSIT_REQUEST_SECONDS
+    city = _city(deadline)
+    found = []
+    for stop in _all_stops(city, deadline):
+        name = "".join(stop["name"].split())
+        if keyword in name:
+            found.append((name != keyword, not name.startswith(keyword), len(name), stop["name"], stop["id"], stop))
+    result = []
+    for *_, stop in sorted(found, key=lambda item: item[:5]):
+        # 길 건너편처럼 이름이 같고 가까운 정류장은 하나만 보여 주고 좌표는 실제 정류장 값을 그대로 쓴다.
+        if any(kept["name"] == stop["name"] and distance_m(kept["latitude"], kept["longitude"],
+                                                           stop["latitude"], stop["longitude"]) <= 300
+               for kept in result):
+            continue
+        result.append({**stop, "tago_id": stop["id"], "id": "tago:" + stop["id"], "address": None, "kind": "STOP"})
+        if len(result) >= 15:
+            break
+    return result
 
 
 def stop_routes(stop_id: str) -> list[dict]:
@@ -219,7 +248,13 @@ def _odsay(operation, params, deadline):
             if not isinstance(error, dict):
                 raise _invalid("ODSAY")
             code = str(error.get("code", ""))
-            if code in ("3", "4", "5", "-98", "-99"):
+            # 출발지와 목적지가 700m 이내이면 버스 경로 대신 도보 이동을 안내한다.
+            if code == "-98":
+                raise ServiceError("ROUTE_TOO_CLOSE", "출발지와 목적지가 가까워(700m 이내) 버스 경로가 없습니다. 걸어서 이동해 주세요.", 404)
+            # 인증 실패 표기는 원문을 노출하지 않고 오류 코드로만 구분한다.
+            if "apikeyauthfailed" in str(error.get("message") or error.get("msg") or "").lower():
+                raise ServiceError("ODSAY_AUTH_FAILED", "ODsay API 인증에 실패했습니다. API 키와 등록된 서버 IP를 확인해 주세요.")
+            if code in ("3", "4", "5", "-99"):
                 raise ServiceError("ROUTE_NOT_FOUND", "이용 가능한 대중교통 경로가 없습니다.", 404)
             if code == "6":
                 raise ServiceError("REGION_UNSUPPORTED", "ODsay가 지원하지 않는 지역입니다.", 422)
@@ -504,9 +539,14 @@ def _arrival(segment, city, stops, deadline):
             malformed = True
     if not choices:
         return {"status": "unavailable", "reason": "TAGO_RESPONSE_INVALID" if malformed else "ARRIVAL_NOT_AVAILABLE"}
-    seconds, remaining = min(choices)
+    choices.sort()
+    seconds, remaining = choices[0]
+    # 두 번째 차량은 실제 응답 행이 있을 때만 다음 도착 정보로 전달한다.
+    following = choices[1] if len(choices) > 1 else None
     return {"status": "available", "minutes": ceil(seconds / 60), "seconds": seconds,
-            "remaining_stops": remaining, "observed_at": payload["observed_at"], "reason": None}
+            "remaining_stops": remaining, "observed_at": payload["observed_at"], "reason": None,
+            "next_minutes": ceil(following[0] / 60) if following else None,
+            "next_remaining_stops": following[1] if following else None}
 
 
 def find_routes(origin: dict, destination: dict) -> list[dict]:

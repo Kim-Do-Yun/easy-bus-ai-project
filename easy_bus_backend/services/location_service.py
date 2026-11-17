@@ -2,6 +2,8 @@ from math import asin, cos, isfinite, radians, sin, sqrt
 from concurrent.futures import Future, TimeoutError as FutureTimeout
 from copy import deepcopy
 from hashlib import sha256
+from html import unescape
+import re
 from threading import Lock
 from time import monotonic
 from xml.etree import ElementTree
@@ -34,11 +36,101 @@ def distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def search_locations(query: str) -> list[dict]:
-    # 실제 장소 데이터와 사용 가능한 검색 API가 확인되면 이 지점에 연동한다.
+    # 장소명은 네이버 지역 검색, 주소는 네이버 Geocoding, 정류장은 TAGO 원주시 목록으로 찾아 실제 좌표 후보만 반환한다.
+    if not query.strip():
+        raise ServiceError("LOCATION_QUERY_EMPTY", "검색할 장소나 주소를 입력해 주세요.", 422)
+    query = query.strip()
+    # 순환 참조를 피하기 위해 정류장 목록 조회는 호출 시점에 가져온다.
+    from easy_bus_backend.services import bus_service
+    results, errors = [], []
+    # 한 공급자의 실패가 다른 공급자의 검색 결과를 가리지 않도록 각각 조회한다.
+    for loader in (_local_search, _geocode, bus_service.search_stop_places):
+        try:
+            results.extend(loader(query))
+        except ServiceError as exc:
+            errors.append(exc)
+    places = _merge_places(results)
+    if places:
+        return places
+    # 결과가 하나도 없을 때만 장소명 검색 오류를 우선하여 인증·지연 오류를 그대로 안내한다.
+    failures = [error for error in errors if error.code != "LOCATION_NOT_FOUND"]
+    if failures:
+        raise failures[0]
+    raise ServiceError("LOCATION_NOT_FOUND",
+                       "검색 결과가 없습니다. 원주시의 장소명, 도로명·지번 주소 또는 버스 정류장 이름으로 다시 입력해 주세요.", 404)
+
+
+def _merge_places(places: list[dict]) -> list[dict]:
+    # 이름 또는 주소가 같고 100m 이내인 후보는 같은 장소로 보고 먼저 찾은 결과(장소명 > 주소 > 정류장)를 남긴다.
+    merged = []
+    for place in places:
+        name = "".join(place["name"].split())
+        address = place.get("address")
+        if any(kept["id"] == place["id"]
+               or (("".join(kept["name"].split()) == name or (address and kept.get("address") == address))
+                   and distance_m(kept["latitude"], kept["longitude"], place["latitude"], place["longitude"]) <= 100)
+               for kept in merged):
+            continue
+        merged.append(place)
+    # 원주시 주소 또는 원주시 정류장 후보를 앞에 두고, 같은 순위 안에서는 공급자 순서를 유지한다.
+    return sorted(merged, key=lambda p: not (p.get("kind") == "STOP" or "원주" in (p.get("address") or "")))
+
+
+def _local_search(query: str) -> list[dict]:
+    # 네이버 개발자센터 지역 검색 API는 서버에서만 호출하여 Client Secret이 앱에 포함되지 않게 한다.
+    if not config.NAVER_SEARCH_CLIENT_ID.strip() or not config.NAVER_SEARCH_CLIENT_SECRET.strip():
+        raise ServiceError("NAVER_SEARCH_CONFIG_MISSING", "네이버 장소 검색 API 인증정보를 설정해 주세요.")
+    deadline = monotonic() + config.TRANSIT_REQUEST_SECONDS
+    # 원주가 빠진 검색어는 원주를 붙인 검색도 함께 수행해 원주시 장소를 우선 확보한다.
+    queries = [query] if "원주" in query else ["원주 " + query, query]
+    places = []
+    for text in queries:
+        places.extend(cached(("local", text), 300, lambda text=text: _local_items(text, deadline), deadline))
+    return places
+
+
+def _local_items(text: str, deadline: float) -> list[dict]:
+    try:
+        result = request_json("NAVER_SEARCH", "https://openapi.naver.com/v1/search/local.json",
+                              {"query": text, "display": 5, "start": 1, "sort": "random"}, deadline,
+                              headers={"X-Naver-Client-Id": config.NAVER_SEARCH_CLIENT_ID.strip(),
+                                       "X-Naver-Client-Secret": config.NAVER_SEARCH_CLIENT_SECRET.strip()})
+    except ServiceError as exc:
+        # 공급자 코드명 대신 사용자가 이해할 수 있는 안내로 바꾸고 오류 코드는 유지한다.
+        if exc.code in ("NAVER_SEARCH_AUTH_FAILED", "NAVER_SEARCH_HTTP_ERROR"):
+            raise ServiceError(exc.code, "네이버 장소 검색 API 인증 또는 검색 API 사용 설정을 확인해 주세요.", exc.status) from None
+        if exc.code == "NAVER_SEARCH_QUOTA_EXCEEDED":
+            raise ServiceError(exc.code, "네이버 장소 검색 호출 한도를 초과했습니다. 잠시 후 다시 시도해 주세요.", 429) from None
+        if exc.code == "NAVER_SEARCH_TIMEOUT":
+            raise ServiceError(exc.code, "장소 검색 응답이 지연되고 있습니다. 잠시 후 다시 시도해 주세요.", 504) from None
+        raise
+    items = result.get("items")
+    if not isinstance(items, list):
+        raise ServiceError("NAVER_SEARCH_RESPONSE_INVALID", "장소 검색 응답 형식을 확인할 수 없습니다.", 502)
+    places = []
+    for item in items:
+        try:
+            # 제목의 강조 태그와 HTML 문자를 제거한 장소명만 사용한다.
+            name = unescape(re.sub(r"<[^>]+>", "", str(item["title"]))).strip()
+            address = str(item.get("roadAddress") or item.get("address") or "").strip() or None
+            # 지역 검색 좌표는 WGS84 경위도에 10^7을 곱한 값이며 mapx가 경도, mapy가 위도이다.
+            longitude, latitude = float(item["mapx"]) / 1e7, float(item["mapy"]) / 1e7
+            validate_coordinate(latitude, longitude)
+        except (KeyError, TypeError, ValueError, ServiceError):
+            continue
+        # 국내 범위를 벗어난 좌표는 다른 좌표체계로 보고 선택 가능한 후보에서 제외한다.
+        if not name or not (33 <= latitude <= 39 and 124 <= longitude <= 132):
+            continue
+        places.append({"id": "naver_local:" + sha256(f"{name}|{address}".encode()).hexdigest()[:20],
+                       "name": name, "address": address, "kind": "PLACE",
+                       "latitude": latitude, "longitude": longitude})
+    return places
+
+
+def _geocode(query: str) -> list[dict]:
+    # 네이버 Maps Geocoding은 주소 검색 전용이며 상호명 검색은 별도 인증의 지역 검색 API가 필요하다.
     if not config.NAVER_API_KEY_ID.strip() or not config.NAVER_API_KEY.strip():
         raise ServiceError("NAVER_CONFIG_MISSING", "네이버 서버 API 인증정보를 설정해 주세요.")
-    if not query.strip():
-        raise ServiceError("LOCATION_QUERY_EMPTY", "검색할 주소를 입력해 주세요.", 422)
     deadline = monotonic() + config.TRANSIT_REQUEST_SECONDS
 
     def load():
@@ -58,12 +150,12 @@ def search_locations(query: str) -> list[dict]:
                 latitude, longitude = float(item["y"]), float(item["x"])
                 validate_coordinate(latitude, longitude)
                 places.append({"id": "naver:" + sha256(address.encode()).hexdigest()[:20],
-                               "name": address, "address": address,
+                               "name": address, "address": address, "kind": "ADDRESS",
                                "latitude": latitude, "longitude": longitude})
         except (KeyError, TypeError, ValueError, AttributeError, ServiceError):
             raise ServiceError("NAVER_RESPONSE_INVALID", "주소 검색 좌표를 확인할 수 없습니다.", 502) from None
         if not places:
-            raise ServiceError("LOCATION_NOT_FOUND", "주소 검색 결과가 없습니다. 상호명 대신 도로명 또는 지번 주소를 입력해 주세요.", 404)
+            raise ServiceError("LOCATION_NOT_FOUND", "주소 검색 결과가 없습니다.", 404)
         return sorted(places, key=lambda p: "원주시" not in p["address"])
 
     return cached(("geocode", query.strip()), 300, load, deadline)
@@ -112,7 +204,8 @@ class _CredentialFilter(logging.Filter):
     def filter(self, record):
         message = record.getMessage()
         for secret in (config.ODSAY_API_KEY, config.TAGO_SERVICE_KEY,
-                       config.NAVER_API_KEY_ID, config.NAVER_API_KEY):
+                       config.NAVER_API_KEY_ID, config.NAVER_API_KEY,
+                       config.NAVER_SEARCH_CLIENT_ID, config.NAVER_SEARCH_CLIENT_SECRET):
             if secret:
                 decoded = unquote(secret.strip())
                 values = {secret, secret.strip(), decoded, quote(decoded, safe=""), quote_plus(decoded),
