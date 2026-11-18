@@ -33,8 +33,18 @@ class EasyColors {
   static const recording = Color(0xFFEF4444);
   static const walk = Color(0xFF64748B);
   static const List<BoxShadow> cardShadow = [
-    BoxShadow(color: Color(0x1A000000), offset: Offset(0, 4), blurRadius: 6, spreadRadius: -1),
-    BoxShadow(color: Color(0x1A000000), offset: Offset(0, 2), blurRadius: 4, spreadRadius: -2),
+    BoxShadow(
+      color: Color(0x1A000000),
+      offset: Offset(0, 4),
+      blurRadius: 6,
+      spreadRadius: -1,
+    ),
+    BoxShadow(
+      color: Color(0x1A000000),
+      offset: Offset(0, 2),
+      blurRadius: 4,
+      spreadRadius: -2,
+    ),
   ];
 }
 
@@ -52,6 +62,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // 출발지가 비어 있으면 안내 문구를 표시하고 기존 GPS 분기를 사용한다.
   final _origin = TextEditingController();
   final _destination = TextEditingController();
+  final _originFocus = FocusNode(), _destinationFocus = FocusNode();
+  String _status = '', _heard = '';
+  String? _voiceProblem;
+  bool _editingInputs = false;
+  ModalBottomSheetRoute<Place>? _placeSheet;
   // 후보 목록에서 확정한 출발지·목적지와 선택 마커이며 입력 문구가 바뀌면 확정을 해제한다.
   Place? _originPlace, _destinationPlace;
   NMarker? _originMarker, _destinationMarker;
@@ -67,21 +82,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _loading = false;
   bool _audioTransition = false;
   // 음성 대화 상태이며 출발지·목적지 값 자체는 기존 입력창과 확정 장소를 그대로 사용한다.
-  // 진행 중 여부, 직전에 물은 항목(origin·destination·both), 재질문 횟수, 현재 위치 출발 여부를 둔다.
+  // 인식 결과를 받은 시도를 단계별로 센다. 통신 오류·장치 오류·취소는 제외한다.
   bool _voiceActive = false;
   String? _awaitingSlot;
-  int _voiceRetries = 0;
+  int _voiceAttempts = 0;
   bool _voiceCurrentLocation = false;
-  static const _maxVoiceRetries = 3;
-  // 말소리를 인식하지 못한 서버 오류 코드이며 재질문 횟수에 포함한다.
+  // 말소리를 인식하지 못한 오류만 실패 횟수에 포함한다.
   static const _speechRetryCodes = {
     'EMPTY_AUDIO',
     'EMPTY_SPEECH',
     'SPEECH_FAILED',
-    'INVALID_AUDIO',
-    'AUDIO_DURATION',
   };
-  Timer? _loadingTimer, _recordTimer;
+  Timer? _loadingTimer;
   final List<NOverlayInfo> _routeOverlays = [];
   Future<void> _mapQueue = Future.value();
   // 화면 상태별 최초 빌드만 기록하여 재빌드 시 로그가 반복되지 않게 한다.
@@ -94,7 +106,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     _initElapsed.start();
-    debugPrint('[EASY_BUS_INIT] HomeScreen initState 진입 (화면=${_initElapsed.elapsedMilliseconds}ms)');
+    debugPrint(
+      '[EASY_BUS_INIT] HomeScreen initState 진입 (화면=${_initElapsed.elapsedMilliseconds}ms)',
+    );
     WidgetsBinding.instance.addObserver(this);
     _origin.addListener(() => _releaseSelection(true));
     _destination.addListener(() => _releaseSelection(false));
@@ -189,18 +203,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   // 입력창에서 검색 키를 누르면 후보를 찾아 선택만 하고, 경로 검색은 출발지·목적지 확정 후 수행한다.
   Future<void> _pickPlace(bool isOrigin) async {
-    if (_busy || _phase == HomePhase.recording) return;
+    if (_busy || _audioTransition || _phase == HomePhase.recording) return;
     final text = (isOrigin ? _origin : _destination).text.trim();
     // 출발지를 비우면 기존 GPS 출발 분기를 그대로 사용한다.
     if (text.isEmpty) {
       if (!isOrigin) _notice('목적지를 입력해 주세요.');
       return;
     }
-    final id = _begin();
+    final id = _begin('장소를 찾고 있어요.');
     try {
       final place = await _resolve(text, id, isOrigin ? '출발지' : '목적지');
       if (!_valid(id) || place == null) return;
       await _confirmPlace(place, isOrigin);
+      if (!_valid(id)) return;
+      setState(() {
+        _voiceAttempts = 0;
+        _voiceProblem = null;
+      });
     } catch (error) {
       if (_valid(id)) _notice(error);
     } finally {
@@ -224,8 +243,152 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
+  void _setStatus(String message) {
+    if (mounted) setState(() => _status = message);
+  }
+
+  // 무발화·인식 실패도 한 번의 시도이다. 통신 오류·장치 오류·취소는 여기에 보내지 않는다.
+  Future<void> _voiceFailure(String message) async {
+    if (!mounted) return;
+    _voiceAttempts++;
+    final guidance = _voiceAttempts >= VoicePolicy.maxAttempts
+        ? '$message 화면에서 장소를 고르거나 글자로 입력해 주세요.'
+        : '$message 다시 말하거나 화면에서 고르거나 글자로 입력해 주세요.';
+    setState(() => _voiceProblem = guidance);
+    _notice(guidance);
+    try {
+      await _device.speak(guidance);
+    } catch (_) {
+      /* 화면 안내는 유지한다. */
+    }
+  }
+
+  void _typeInstead() {
+    if (_busy || _audioTransition) return;
+    setState(() {
+      _editingInputs = true;
+      _voiceProblem = null;
+    });
+    final origin =
+        _awaitingSlot == 'origin' ||
+        (_origin.text.isEmpty && !_voiceCurrentLocation);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) (origin ? _originFocus : _destinationFocus).requestFocus();
+    });
+  }
+
+  // 부분 인식 문자열을 수정해 기존 후보 검색으로 연결한다. 후보의 역할은 사용자가 지정한다.
+  Future<void> _chooseInstead() async {
+    if (_busy || _audioTransition) return;
+    final generation = _request;
+    var query = _awaitingSlot == 'origin'
+        ? _origin.text
+        : _awaitingSlot == 'destination'
+        ? _destination.text
+        : _heard;
+    if (query.trim().isEmpty) query = _heard;
+    final choice = await showModalBottomSheet<({bool origin, String query})>(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheetContext) => SafeArea(
+        child: Padding(
+          padding: EdgeInsets.fromLTRB(
+            20,
+            20,
+            20,
+            MediaQuery.viewInsetsOf(sheetContext).bottom + 20,
+          ),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text('찾을 장소를 확인해 주세요', style: TextStyle(fontSize: 22)),
+                TextFormField(
+                  initialValue: query,
+                  onChanged: (value) => query = value,
+                  style: const TextStyle(fontSize: 20),
+                  decoration: const InputDecoration(hintText: '장소 이름 입력'),
+                ),
+                for (final origin in [true, false])
+                  Padding(
+                    padding: const EdgeInsets.only(top: 12),
+                    child: SizedBox(
+                      width: double.infinity,
+                      height: 56,
+                      child: FilledButton(
+                        onPressed: () {
+                          if (query.trim().isNotEmpty) {
+                            Navigator.pop(sheetContext, (
+                              origin: origin,
+                              query: query.trim(),
+                            ));
+                          }
+                        },
+                        child: Text(
+                          origin ? '출발지 후보 보기' : '목적지 후보 보기',
+                          style: const TextStyle(fontSize: 20),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    if (!_valid(generation) || choice == null) return;
+    (choice.origin ? _origin : _destination).text = choice.query;
+    _awaitingSlot = choice.origin ? 'origin' : 'destination';
+    _editingInputs = true;
+    final id = _begin('장소를 찾고 있어요.');
+    var confirmed = false;
+    try {
+      final place = await _resolve(
+        choice.query,
+        id,
+        choice.origin ? '출발지' : '목적지',
+      );
+      if (!_valid(id) || place == null) return;
+      await _confirmPlace(place, choice.origin);
+      if (!_valid(id)) return;
+      confirmed = true;
+      setState(() {
+        _editingInputs = true;
+        _voiceProblem = null;
+        _voiceAttempts = 0;
+        if (choice.origin) _voiceCurrentLocation = false;
+        _awaitingSlot = _origin.text.isEmpty && !_voiceCurrentLocation
+            ? 'origin'
+            : _destination.text.isEmpty
+            ? 'destination'
+            : null;
+      });
+    } catch (error) {
+      if (_valid(id)) {
+        _notice(error);
+        setState(() => _voiceProblem = error.toString());
+      }
+    } finally {
+      if (_valid(id)) {
+        _loadingTimer?.cancel();
+        setState(() {
+          _loading = false;
+          _phase = HomePhase.map;
+        });
+      }
+    }
+    if (confirmed &&
+        _valid(id) &&
+        _destination.text.isNotEmpty &&
+        (_origin.text.isNotEmpty || _voiceCurrentLocation))
+      await _search();
+  }
+
   Future<void> _prepareMap(NaverMapController controller) async {
-    debugPrint('[EASY_BUS_INIT] onMapReady 호출 (화면=${_initElapsed.elapsedMilliseconds}ms)');
+    debugPrint(
+      '[EASY_BUS_INIT] onMapReady 호출 (화면=${_initElapsed.elapsedMilliseconds}ms)',
+    );
     _map = controller;
     final generation = _request;
     final stageElapsed = Stopwatch()..start();
@@ -233,7 +396,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     try {
       debugPrint('[EASY_BUS_INIT] $stage 시작');
       final position = await _device.currentPosition();
-      debugPrint('[EASY_BUS_INIT] $stage 완료 (단계=${stageElapsed.elapsedMilliseconds}ms)');
+      debugPrint(
+        '[EASY_BUS_INIT] $stage 완료 (단계=${stageElapsed.elapsedMilliseconds}ms)',
+      );
       if (!mounted) return;
       stage = '현재 위치 지도 반영';
       stageElapsed.reset();
@@ -250,9 +415,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         );
       stage = '정류장 조회';
       stageElapsed.reset();
-      debugPrint('[EASY_BUS_INIT] $stage 시작 (화면=${_initElapsed.elapsedMilliseconds}ms)');
+      debugPrint(
+        '[EASY_BUS_INIT] $stage 시작 (화면=${_initElapsed.elapsedMilliseconds}ms)',
+      );
       final stops = await _api.stops(position);
-      debugPrint('[EASY_BUS_INIT] $stage 완료 (단계=${stageElapsed.elapsedMilliseconds}ms)');
+      debugPrint(
+        '[EASY_BUS_INIT] $stage 완료 (단계=${stageElapsed.elapsedMilliseconds}ms)',
+      );
       if (!mounted) return;
       stage = '정류장 지도 반영';
       stageElapsed.reset();
@@ -267,20 +436,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     } catch (error) {
       // 위치와 응답 원문은 제외하고 실패 단계의 유형과 소요 시간만 기록한다.
-      debugPrint('[EASY_BUS_INIT] $stage 예외 유형=${error.runtimeType} '
-          '(단계=${stageElapsed.elapsedMilliseconds}ms)');
-      _notice(error);
+      debugPrint(
+        '[EASY_BUS_INIT] $stage 예외 유형=${error.runtimeType} '
+        '(단계=${stageElapsed.elapsedMilliseconds}ms)',
+      );
+      if (_valid(generation)) _notice(error);
     }
   }
 
   NLatLng _latLng(Place p) => NLatLng(p.latitude, p.longitude);
 
-  int _begin() {
+  int _begin([String message = '장소를 확인하고 있어요.']) {
     final id = ++_request;
     _loadingTimer?.cancel();
     setState(() {
       _phase = HomePhase.processing;
       _loading = false;
+      _status = message;
     });
     // 빠른 응답에는 로딩 화면을 띄우지 않아 깜빡임을 줄인다.
     _loadingTimer = Timer(const Duration(milliseconds: 300), () {
@@ -292,13 +464,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<Place?> _resolve(String name, int id, String label) async {
     if (name.trim().isEmpty) throw Exception('$label 장소를 입력해 주세요.');
     final candidates = await _api.locations(name.trim());
-    if (!_valid(id)) return null;
+    if (!mounted || !_valid(id)) return null;
     if (candidates.isEmpty)
-      throw Exception('$label 장소를 찾지 못했습니다. 이름을 자세히 입력해 주세요.');
-    if (candidates.length == 1) return candidates.first;
+      throw ApiException(
+        '$label 장소를 찾지 못했습니다. 이름을 자세히 입력해 주세요.',
+        'LOCATION_NOT_FOUND',
+      );
+    // 한 후보여도 부분 명칭·다른 지역일 수 있으므로 주소를 보고 직접 확정한다.
     // 동명이인 장소는 자동 선택하지 않고 사용자에게 후보를 보여 준다.
-    return showModalBottomSheet<Place>(
-      context: context,
+    final navigator = Navigator.of(context);
+    final sheet = ModalBottomSheetRoute<Place>(
+      capturedThemes: InheritedTheme.capture(
+        from: context,
+        to: navigator.context,
+      ),
       isScrollControlled: true,
       builder: (context) => SafeArea(
         child: SizedBox(
@@ -318,7 +497,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       .map(
                         (p) => ListTile(
                           minVerticalPadding: 16,
-                          title: Text(p.name),
+                          title: Text(
+                            p.name,
+                            style: const TextStyle(fontSize: 20),
+                          ),
                           // 장소 구분과 주소(정류장은 정류장 번호)를 표시하고, 둘 다 없으면 기존처럼 좌표를 보여 준다.
                           subtitle: Text(
                             p.tagoId != null || p.kind == 'STOP'
@@ -338,15 +520,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
       ),
     );
+    _placeSheet = sheet;
+    try {
+      return await navigator.push(sheet);
+    } finally {
+      if (identical(_placeSheet, sheet)) _placeSheet = null;
+    }
   }
 
   Future<void> _search({String? audioPath}) async {
-    if (_busy || _phase == HomePhase.recording) return;
+    if (_busy || _audioTransition || _phase == HomePhase.recording) return;
+    final attemptsBefore = _voiceAttempts;
     final id = _begin();
     try {
       var originName = _origin.text.trim();
       var destinationName = _destination.text.trim();
       if (audioPath != null) {
+        _setStatus('음성을 전송하고 말씀을 확인하고 있어요.');
         // 출발지·목적지가 모두 확인될 때까지는 재질문만 하고 경로 검색으로 넘어가지 않는다.
         if (!await _voiceTurn(audioPath, id) || !_valid(id)) return;
         originName = _origin.text.trim();
@@ -356,17 +546,40 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // 후보 목록에서 이미 확정한 장소는 다시 검색하지 않고 저장한 좌표를 그대로 사용한다.
       final originPlace = _originPlace, destinationPlace = _destinationPlace;
       final voice = audioPath != null;
+      _setStatus(
+        originName.isEmpty || originName == '현재 위치'
+            ? '현재 위치를 확인하고 있어요.'
+            : '출발지를 확인하고 있어요.',
+      );
       final origin = originName.isEmpty || originName == '현재 위치'
           ? await _currentOrigin(id, voice)
           : originPlace != null && originPlace.name == originName
           ? originPlace
           : await _resolvePlace(originName, id, true, voice);
       if (!_valid(id) || origin == null) return;
+      try {
+        if (origin.id != 'current' && !identical(origin, _originPlace)) {
+          await _confirmPlace(origin, true, moveCamera: false);
+        }
+      } catch (_) {
+        /* 좌표 확정 후 지도 마커 실패는 경로 검색을 막지 않는다. */
+      }
+      if (!_valid(id)) return;
+      _setStatus('목적지를 확인하고 있어요.');
       final destination =
           destinationPlace != null && destinationPlace.name == destinationName
           ? destinationPlace
           : await _resolvePlace(destinationName, id, false, voice);
       if (!_valid(id) || destination == null) return;
+      try {
+        if (!identical(destination, _destinationPlace)) {
+          await _confirmPlace(destination, false, moveCamera: false);
+        }
+      } catch (_) {
+        /* 좌표 확정 후 지도 마커 실패는 경로 검색을 막지 않는다. */
+      }
+      if (!_valid(id)) return;
+      _setStatus('버스 경로를 찾고 있어요.');
       if (voice) {
         try {
           await _device.speak('버스 경로를 찾고 있습니다.');
@@ -374,6 +587,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           /* 시작 안내 실패는 경로 검색을 막지 않는다. */
         }
       }
+      if (!_valid(id)) return;
       final routes = await _api.routes(origin, destination);
       if (!_valid(id)) return;
       if (routes.isEmpty || routes.first.segments.isEmpty)
@@ -399,6 +613,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (!_valid(id)) return;
       // 경로를 받으면 음성 대화를 마치고 다음 음성 입력은 새 경로 요청으로 본다.
       _resetVoice();
+      setState(() {
+        _editingInputs = false;
+        _status = '경로를 찾았습니다.';
+      });
       // 검색 버튼에서 바로 고른 장소도 확정해 두어 뒤로 가기 후 다시 검색할 때 재조회하지 않는다.
       // 경로 화면 맞춤을 유지하도록 카메라는 움직이지 않으며 선택 마커는 경로를 지울 때 보인다.
       try {
@@ -417,8 +635,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     } catch (error) {
       if (_valid(id)) {
+        // 장소·경로 서버 장애 때문에 음성 입력 한도가 소모되지는 않게 한다.
+        if (audioPath != null &&
+            error is ApiException &&
+            _voiceAttempts > attemptsBefore) {
+          _voiceAttempts = attemptsBefore;
+        }
         _notice(error);
         setState(() => _phase = HomePhase.attention);
+        if (audioPath != null)
+          setState(
+            () => _voiceProblem = error.toString().replaceFirst(
+              'Exception: ',
+              '',
+            ),
+          );
         // 음성으로 요청한 경우 실패 안내도 기존 TTS로 들려준다.
         if (audioPath != null) {
           try {
@@ -456,10 +687,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       text = await _api.speech(audioPath);
     } on ApiException catch (error) {
       if (!_valid(id) || !_speechRetryCodes.contains(error.code)) rethrow;
-      await _askAgain(error.message);
+      await _voiceFailure(error.message);
       return false;
     }
     if (!_valid(id)) return false;
+    _voiceAttempts++;
+    _heard = text;
+    _setStatus('말씀의 뜻을 확인하고 있어요.');
     final Interpretation result;
     try {
       result = await _api.interpret(
@@ -467,18 +701,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         expectedSlot: _awaitingSlot == 'both' ? null : _awaitingSlot,
       );
     } on ApiException catch (error) {
-      if (!_valid(id) || error.code != 'INVALID_AI_RESPONSE') rethrow;
+      if (!_valid(id)) rethrow;
+      if (error.code != 'INVALID_AI_RESPONSE') {
+        // 해석 서버·통신 문제로 중단된 시도는 사용자 입력 한도를 소모하지 않는다.
+        _voiceAttempts--;
+        rethrow;
+      }
       await _askAgain('어디에서 어디로 가시는지 다시 말씀해 주세요.', heard: text);
+      if (_valid(id)) setState(() => _voiceProblem = '들은 말씀을 장소로 확인하지 못했습니다.');
       return false;
     }
     if (!_valid(id)) return false;
-    // 이전 경로를 보는 중에 시작한 새 요청이면 이전 장소를 비우고, 진행 중인 대화나 직접 입력한 값은 유지한다.
-    if (!_voiceActive && _route != null) {
-      _origin.text = '';
-      _destination.text = '';
-      _voiceCurrentLocation = false;
-    }
     _voiceActive = true;
+    if (result.origin == null &&
+        result.destination == null &&
+        !result.useCurrentLocation) {
+      setState(() => _voiceProblem = '들은 말씀에서 장소를 골라 주세요.');
+    }
     // 이번 발화에서 말한 항목만 갱신하고, 말하지 않은 항목과 확정 장소는 그대로 둔다.
     if (result.useCurrentLocation) {
       _origin.text = '';
@@ -499,6 +738,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         : !hasOrigin
         ? 'origin'
         : 'destination';
+    // 한 항목을 얻고 다른 항목을 새로 묻는 경우만 다음 단계의 한도를 시작한다.
+    if (slot != _awaitingSlot &&
+        (result.origin != null ||
+            result.destination != null ||
+            result.useCurrentLocation)) {
+      _voiceAttempts = 0;
+    }
     await _askAgain(
       slot == 'both'
           ? '어디에서 어디로 가시는지 말씀해 주세요.'
@@ -511,15 +757,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return false;
   }
 
-  // 재질문은 화면 안내와 TTS로 함께 전달하고, 최대 횟수를 넘으면 직접 입력으로 안내한다.
+  // 누락 장소 재질문은 화면과 TTS로 전달하며 인식 실패 횟수에 포함하지 않는다.
   Future<void> _askAgain(String question, {String? slot, String? heard}) async {
     var message = question;
-    if (++_voiceRetries > _maxVoiceRetries) {
-      // 이미 확인한 장소는 입력창에 남겨 두고 대화 상태만 초기화한다.
-      _resetVoice();
-      message = '음성으로 장소를 확인하지 못했습니다. 입력창에 출발지와 목적지를 직접 입력하거나 검색해 주세요.';
-    } else if (slot != null) {
+    if (slot != null) {
       _awaitingSlot = slot;
+    }
+    if (_voiceAttempts >= VoicePolicy.maxAttempts) {
+      message = '$question 화면에서 고르거나 글자로 입력해 주세요.';
+      setState(() => _voiceProblem = message);
     }
     _notice(heard == null ? message : '"$heard"\n$message');
     try {
@@ -532,24 +778,29 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void _resetVoice() {
     _voiceActive = false;
     _awaitingSlot = null;
-    _voiceRetries = 0;
+    _voiceAttempts = 0;
     _voiceCurrentLocation = false;
+    _heard = '';
+    _voiceProblem = null;
   }
 
   // 음성 대화에서 현재 위치를 확인하지 못하면 임의 좌표 없이 출발지를 다시 묻는다.
   Future<Place?> _currentOrigin(int id, bool voice) async {
-    if (!voice) return _device.currentPosition();
     try {
       return await _device.currentPosition();
-    } catch (_) {
+    } catch (error) {
       if (!_valid(id)) return null;
       _voiceCurrentLocation = false;
+      setState(() {
+        _voiceProblem = error.toString();
+        _editingInputs = true;
+      });
       await _askAgain('현재 위치를 확인하지 못했습니다. 어디에서 출발하시나요?', slot: 'origin');
       return null;
     }
   }
 
-  // 음성 대화에서 장소를 찾지 못하면 해당 항목만 비우고 다시 물으며 다른 항목은 유지한다.
+  // 장소를 찾지 못하면 문자열과 다른 항목을 보존하여 화면 검색에도 재사용한다.
   Future<Place?> _resolvePlace(
     String name,
     int id,
@@ -560,11 +811,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (!voice) return _resolve(name, id, label);
     try {
       return await _resolve(name, id, label);
-    } on ApiException {
-      rethrow;
-    } catch (_) {
+    } on ApiException catch (error) {
+      if (error.code != 'LOCATION_NOT_FOUND') rethrow;
       if (!_valid(id)) return null;
-      (isOrigin ? _origin : _destination).text = '';
+      // 인식된 문자열과 다른 쪽의 확정 장소를 남겨 화면 검색에 재사용한다.
+      setState(() => _voiceProblem = '$name 장소를 찾지 못했습니다.');
       await _askAgain(
         '$name 장소를 찾지 못했습니다. $label 이름을 다시 말씀해 주세요.',
         slot: isOrigin ? 'origin' : 'destination',
@@ -701,9 +952,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   id: 'route_${id}_${i}_stop_$k',
                   position: _latLng(stop),
                   icon: stopIcon,
-                  iconTintColor: stopIcon == null
-                      ? accent
-                      : Colors.transparent,
+                  iconTintColor: stopIcon == null ? accent : Colors.transparent,
                   size: stopIcon == null
                       ? const Size(14, 18)
                       : const Size(16, 16),
@@ -851,12 +1100,33 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _microphone() async {
     if (_busy || _audioTransition) return;
     if (_phase == HomePhase.recording) {
-      _recordTimer?.cancel();
       // 녹음 종료 중에도 중복 탭을 막는다.
-      final id = _begin();
+      final id = _begin('녹음을 완료하고 있어요.');
       setState(() => _audioTransition = true);
       String? recordedPath;
       try {
+        if (!_device.heardSpeech) {
+          final unavailable = _device.detectionUnavailable;
+          await _device.cancelRecording();
+          if (!_valid(id)) return;
+          if (unavailable) {
+            setState(
+              () => _voiceProblem =
+                  '마이크 음량을 확인하지 못했습니다. 다시 말하거나 다른 입력 방법을 선택해 주세요.',
+            );
+            _notice(_voiceProblem!);
+          } else {
+            await _voiceFailure('말소리가 감지되지 않았습니다.');
+          }
+          if (_valid(id)) {
+            _loadingTimer?.cancel();
+            setState(() {
+              _loading = false;
+              _phase = HomePhase.attention;
+            });
+          }
+          return;
+        }
         final path = await _device.stopRecording();
         if (!_valid(id)) {
           await _device.deleteRecording(path);
@@ -877,7 +1147,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         await _search(audioPath: recordedPath);
       }
     } else {
-      final id = _begin();
+      if (_voiceAttempts >= VoicePolicy.maxAttempts) {
+        setState(() => _voiceProblem = '화면에서 장소를 고르거나 글자로 입력해 주세요.');
+        return;
+      }
+      // 기존 결과는 지도에 유지하되 새 음성 대화에 이전 장소를 섞지 않는다.
+      if (!_voiceActive && _route != null && !_editingInputs) {
+        _origin.clear();
+        _destination.clear();
+        _resetVoice();
+        // 취소 후 다시 입력해도 이번 검색에서 확보한 장소를 이전 결과로 오인해 비우지 않는다.
+        _editingInputs = true;
+      }
+      _voiceActive = true;
+      _voiceProblem = null;
+      final id = _begin('마이크를 준비하고 있어요.');
       // 권한 창이 열린 동안 취소해도 이전 시작 작업이 끝나기 전에는 재녹음을 막는다.
       setState(() => _audioTransition = true);
       try {
@@ -890,8 +1174,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         setState(() {
           _loading = false;
           _phase = HomePhase.recording;
+          _status = '말씀해 주세요.';
         });
-        _recordTimer = Timer(const Duration(seconds: 55), _microphone);
+        _device.monitorRecording(
+          () {
+            if (_valid(id)) _setStatus('말씀을 듣고 있어요.');
+          },
+          () {
+            if (_valid(id) && _phase == HomePhase.recording)
+              unawaited(_microphone());
+          },
+        );
       } catch (error) {
         if (_valid(id)) {
           _cancelRequest();
@@ -905,11 +1198,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   void _cancelRequest() {
     ++_request;
+    _api.cancelRequests();
+    // 취소된 요청의 후보 창만 닫으며 다른 화면을 잘못 pop하지 않는다.
+    final sheet = _placeSheet;
+    _placeSheet = null;
+    if (sheet != null && sheet.isActive) sheet.navigator?.removeRoute(sheet);
     _loadingTimer?.cancel();
     setState(() {
       _loading = false;
       _phase = _route == null ? HomePhase.map : HomePhase.guidance;
+      _status = '요청을 취소했습니다.';
+      _resetVoice();
     });
+    unawaited(_device.stopSpeaking().catchError((Object _) {}));
   }
 
   Future<void> _back() async {
@@ -918,7 +1219,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
     if (_phase == HomePhase.recording) {
-      _recordTimer?.cancel();
       _cancelRequest();
       setState(() => _audioTransition = true);
       try {
@@ -931,6 +1231,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
     ++_request;
+    _resetVoice();
     setState(() {
       _route = null;
       _options = const [];
@@ -962,7 +1263,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (state == AppLifecycleState.paused &&
         (_busy || _phase == HomePhase.recording)) {
       final wasRecording = _phase == HomePhase.recording;
-      _recordTimer?.cancel();
       _cancelRequest();
       // 업로드 중인 파일은 검색 작업이 정리하고 진행 중 녹음만 여기서 취소한다.
       if (wasRecording && !_audioTransition) {
@@ -986,11 +1286,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     ++_request;
     WidgetsBinding.instance.removeObserver(this);
     _loadingTimer?.cancel();
-    _recordTimer?.cancel();
     _api.dispose();
     unawaited(_device.dispose().catchError((Object error) {}));
     _origin.dispose();
     _destination.dispose();
+    _originFocus.dispose();
+    _destinationFocus.dispose();
     super.dispose();
   }
 
@@ -998,8 +1299,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     if (!_initialBuildLogged) {
       _initialBuildLogged = true;
-      debugPrint('[EASY_BUS_INIT] HomeScreen build 최초 진입 (화면=${_initElapsed.elapsedMilliseconds}ms)');
-      debugPrint('[EASY_BUS_INIT] NaverMap 위젯 생성 직전 (화면=${_initElapsed.elapsedMilliseconds}ms)');
+      debugPrint(
+        '[EASY_BUS_INIT] HomeScreen build 최초 진입 (화면=${_initElapsed.elapsedMilliseconds}ms)',
+      );
+      debugPrint(
+        '[EASY_BUS_INIT] NaverMap 위젯 생성 직전 (화면=${_initElapsed.elapsedMilliseconds}ms)',
+      );
     }
     return PopScope(
       canPop: !_busy && _phase != HomePhase.recording && _route == null,
@@ -1020,7 +1325,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 alignment: Alignment.topCenter,
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-                  child: _route == null ? _inputPanel() : _resultPanel(),
+                  child: _route == null || _editingInputs
+                      ? _inputPanel()
+                      : _resultPanel(),
                 ),
               ),
             ),
@@ -1056,6 +1363,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           ),
                         ),
                         const SizedBox(height: 24),
+                        Text(
+                          _status,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            fontSize: 22,
+                            color: EasyColors.white,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 16),
                         Material(
                           color: EasyColors.white,
                           shape: const StadiumBorder(),
@@ -1123,9 +1440,28 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         Expanded(
           child: TextField(
             controller: controller,
+            focusNode: identical(controller, _origin)
+                ? _originFocus
+                : _destinationFocus,
             enabled: !_busy && _phase != HomePhase.recording,
             textInputAction: action,
             onSubmitted: onSubmitted,
+            onChanged: (_) {
+              // 입력 방법만 바꿔 한도를 우회하지 않고 실제로 글자를 고쳤을 때 새 입력으로 본다.
+              setState(() {
+                _voiceAttempts = 0;
+                _voiceProblem = null;
+                _voiceActive = true;
+                if (identical(controller, _origin))
+                  _voiceCurrentLocation = false;
+                _awaitingSlot =
+                    _origin.text.trim().isEmpty && !_voiceCurrentLocation
+                    ? 'origin'
+                    : _destination.text.trim().isEmpty
+                    ? 'destination'
+                    : null;
+              });
+            },
             style: const TextStyle(
               fontSize: 18,
               fontWeight: FontWeight.w600,
@@ -1155,11 +1491,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       Row(
         children: [
           if (_busy || _phase == HomePhase.recording) ...[
-            _circleButton(
-              icon: Icons.arrow_back,
-              label: '뒤로 가기',
-              onTap: _back,
-            ),
+            _circleButton(icon: Icons.arrow_back, label: '뒤로 가기', onTap: _back),
             const SizedBox(width: 8),
           ],
           Expanded(
@@ -1486,8 +1818,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // 선택한 경로의 소요시간·도보·환승은 서버가 제공한 값만 표시한다.
   Widget _routeFacts(BusRoute route) {
     final facts = [
-      if (route.durationMinutes != null)
-        '약 ${route.durationMinutes!.round()}분',
+      if (route.durationMinutes != null) '약 ${route.durationMinutes!.round()}분',
       if (route.totalWalkM != null) '도보 ${_meters(route.totalWalkM!)}',
       route.transferCount == 0 ? '환승 없음' : '환승 ${route.transferCount}회',
     ];
@@ -1520,9 +1851,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         : arrival.available
         ? '도착 예정'
         : '실시간';
-    final timeText = arrival.available
-        ? '약 ${arrival.minutes}분 후'
-        : '도착정보 없음';
+    final timeText = arrival.available ? '약 ${arrival.minutes}분 후' : '도착정보 없음';
     return Semantics(
       button: true,
       label: '$number번 버스 $stopsText $timeText, 상세 보기',
@@ -1598,6 +1927,65 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
+        if (_voiceProblem != null && !_busy && !recording)
+          Container(
+            constraints: BoxConstraints(
+              maxWidth: 340,
+              maxHeight: MediaQuery.sizeOf(context).height * 0.42,
+            ),
+            margin: const EdgeInsets.only(bottom: 12),
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: EasyColors.white,
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(_voiceProblem!, style: const TextStyle(fontSize: 18)),
+                  if (_heard.isNotEmpty)
+                    Text(
+                      '들은 말씀: $_heard',
+                      style: const TextStyle(fontSize: 18),
+                    ),
+                  for (final item in <({String label, VoidCallback? action})>[
+                    (
+                      label: _voiceAttempts >= VoicePolicy.maxAttempts
+                          ? '다시 말하기 (시도 완료)'
+                          : '다시 말하기',
+                      action: _voiceAttempts >= VoicePolicy.maxAttempts
+                          ? null
+                          : () {
+                              unawaited(_microphone());
+                            },
+                    ),
+                    (
+                      label: '화면에서 고르기',
+                      action: () {
+                        unawaited(_chooseInstead());
+                      },
+                    ),
+                    (label: '글자로 입력', action: _typeInstead),
+                  ])
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: SizedBox(
+                        width: double.infinity,
+                        height: 56,
+                        child: OutlinedButton(
+                          onPressed: _audioTransition ? null : item.action,
+                          child: Text(
+                            item.label,
+                            style: const TextStyle(fontSize: 20),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
         if (recording)
           Container(
             margin: const EdgeInsets.only(bottom: 12),
@@ -1607,9 +1995,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               borderRadius: BorderRadius.circular(16),
               boxShadow: EasyColors.cardShadow,
             ),
-            child: const Text(
-              '말씀이 끝나면 버튼을 다시 눌러 주세요',
-              style: TextStyle(
+            child: Text(
+              '$_status\n말씀이 끝나면 자동으로 완료해요.\n버튼을 눌러 직접 끝낼 수도 있어요.',
+              textAlign: TextAlign.center,
+              style: const TextStyle(
                 fontSize: 18,
                 fontWeight: FontWeight.w600,
                 color: EasyColors.onSurface,
