@@ -90,6 +90,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   String? _awaitingSlot;
   int _voiceAttempts = 0;
   bool _voiceCurrentLocation = false;
+  // 음성 대화에서 출발지를 다시 물은 상태이며, 이때 비어 있는 출발지는 현재 위치 출발로 보지 않는다.
+  bool _originRequested = false;
+  // 음량 기준으로 말소리를 감지하지 못한 녹음을 서버로 보냈는지 기록하여 Whisper 판단 결과 로그에 사용한다.
+  bool _uploadWithoutSpeech = false;
   // 말소리를 인식하지 못한 오류만 실패 횟수에 포함한다.
   static const _speechRetryCodes = {
     'EMPTY_AUDIO',
@@ -106,6 +110,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Timer? _suggestTimer;
   // 늦게 도착한 이전 검색어의 응답이 최신 목록을 덮어쓰지 않도록 요청 번호를 비교한다.
   int _suggestRequest = 0;
+  // 현재 후보 목록을 받은 검색어이며 입력창 글자와 같을 때만 후보를 선택할 수 있다.
+  String? _suggestQuery;
   static const _suggestDelay = Duration(milliseconds: 400);
   // 앱의 현재 위치와 지도 마커이며 사용자가 지정한 출발지와 별도로 관리하여 경로 표시 중에도 유지한다.
   Place? _currentPlace;
@@ -151,9 +157,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   // 출발지는 장소 확정 외에 음성으로 '여기서'처럼 현재 위치 출발을 말한 경우도 확정으로 본다.
+  // 출발지 입력창을 비워 둔 경우도 기존 정책대로 현재 위치 출발로 본다.
+  // 단, 출발지에 글자(조합 중 자음·모음 포함)가 있거나 음성 대화에서 출발지를 다시 물은 상태는 제외한다.
   bool get _originReady =>
       _confirmed(true) ||
-      (_voiceCurrentLocation && _origin.text.trim().isEmpty);
+      (_origin.text.trim().isEmpty &&
+          (_voiceCurrentLocation || !_originRequested));
   bool get _destinationReady => _confirmed(false);
 
   // 자음·모음만 입력된 조합 중 글자로는 장소 검색을 하지 않는다.
@@ -163,6 +172,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // 사용자가 입력창을 선택하면 이미 있는 글자로 바로 후보를 찾고, 포커스가 빠지면 해당 목록만 닫는다.
   void _focusChanged(bool isOrigin) {
     if (!mounted) return;
+    // 입력창 포커스에 따라 좌측 상단 뒤로 가기 버튼 표시가 바뀌므로 화면을 다시 그린다.
+    setState(() {});
     final focus = isOrigin ? _originFocus : _destinationFocus;
     if (focus.hasFocus) {
       final text = (isOrigin ? _origin : _destination).text.trim();
@@ -182,8 +193,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final query = (isOrigin ? _origin : _destination).text.trim();
     final request = ++_suggestRequest;
     if (query.isNotEmpty && _onlyJamo(query)) {
-      // 조합 중에는 이전 목록을 유지하고 진행 표시만 멈춘다.
-      if (_suggestLoading) setState(() => _suggestLoading = false);
+      // 조합 중에는 검색하지 않으며, 이전 검색어의 후보를 고르지 않도록 목록 내용만 비운다.
+      if (_suggestOrigin != null &&
+          (_suggestions.isNotEmpty || _suggestLoading)) {
+        setState(() {
+          _suggestions = const [];
+          _suggestQuery = null;
+          _suggestLoading = false;
+          _suggestMessage = '글자를 마저 입력해 주세요.';
+        });
+      }
       return;
     }
     if (_inputLocked || query.isEmpty || _confirmed(isOrigin)) {
@@ -191,7 +210,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
     setState(() {
-      if (_suggestOrigin != isOrigin) _suggestions = const [];
+      // 새 검색어의 결과가 도착하기 전에는 이전 검색어의 후보를 보여 주지 않는다.
+      _suggestions = const [];
+      _suggestQuery = null;
       _suggestOrigin = isOrigin;
       _suggestLoading = true;
       _suggestMessage = null;
@@ -220,6 +241,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (!current()) return;
       setState(() {
         _suggestions = places;
+        _suggestQuery = query;
         _suggestLoading = false;
         _suggestMessage = places.isEmpty ? '검색 결과가 없습니다.' : null;
       });
@@ -245,6 +267,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() {
       _suggestOrigin = null;
       _suggestions = const [];
+      _suggestQuery = null;
       _suggestLoading = false;
       _suggestMessage = null;
     });
@@ -253,6 +276,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // 입력창 아래 후보에서 장소를 고르면 좌표를 확정하고, 두 장소가 모두 확정되면 경로를 한 번 검색한다.
   Future<void> _selectSuggestion(Place place, bool isOrigin) async {
     if (_inputLocked) return;
+    // 현재 입력창 글자와 같은 검색어로 받은 최신 목록의 후보만 선택한다.
+    final text = (isOrigin ? _origin : _destination).text.trim();
+    if (_suggestOrigin != isOrigin ||
+        _suggestQuery != text ||
+        !_suggestions.contains(place)) {
+      debugPrint('[EASY_BUS_SUGGEST] 이전 검색어의 후보 선택을 무시');
+      return;
+    }
     _hideSuggestions();
     final generation = _request;
     try {
@@ -451,7 +482,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _editingInputs = true;
       _voiceProblem = null;
     });
-    final origin = !_originReady;
+    // 글자 입력 전환 시에는 기존처럼 비어 있는 출발지부터 선택하게 한다.
+    final origin =
+        !_confirmed(true) &&
+        !(_voiceCurrentLocation && _origin.text.trim().isEmpty);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) (origin ? _originFocus : _destinationFocus).requestFocus();
     });
@@ -791,12 +825,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // 음성 한 번을 인식·해석하여 기존 출발지·목적지와 합치고, 빠진 장소가 있으면 재질문한 뒤 false를 반환한다.
   Future<bool> _voiceTurn(String audioPath, int id) async {
     final String text;
+    final withoutSpeech = _uploadWithoutSpeech;
+    _uploadWithoutSpeech = false;
     try {
       text = await _api.speech(audioPath);
     } on ApiException catch (error) {
+      if (withoutSpeech) {
+        debugPrint(
+          '[EASY_BUS_VOICE] 음량 미감지 녹음의 Whisper 판단=인식 실패 코드=${error.code}',
+        );
+      }
       if (!_valid(id) || !_speechRetryCodes.contains(error.code)) rethrow;
+      // 서버에서 말소리를 찾지 못한 경우에만 한 번의 실패로 센다.
       await _voiceFailure(error.message);
       return false;
+    }
+    if (withoutSpeech) {
+      debugPrint(
+        '[EASY_BUS_VOICE] 음량 미감지 녹음의 Whisper 판단=문장 인식 길이=${text.length}',
+      );
     }
     if (!_valid(id)) return false;
     _voiceAttempts++;
@@ -815,8 +862,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _voiceAttempts--;
         rethrow;
       }
+      // 장소를 구분할 근거가 분명한 부분만 입력창에 남기고 재질문 단계는 그대로 둔다.
+      final kept = _keepPartialPlaces(text);
       await _askAgain('어디에서 어디로 가시는지 다시 말씀해 주세요.', heard: text);
-      if (_valid(id)) setState(() => _voiceProblem = '들은 말씀을 장소로 확인하지 못했습니다.');
+      if (_valid(id)) {
+        setState(
+          () => _voiceProblem = kept
+              ? '들은 말씀을 장소로 확인하지 못했습니다. 알아들은 장소는 입력창에 남겨 두었습니다.'
+              : '들은 말씀을 장소로 확인하지 못했습니다.',
+        );
+      }
       return false;
     }
     if (!_valid(id)) return false;
@@ -830,7 +885,31 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (result.origin == null &&
         result.destination == null &&
         !result.useCurrentLocation) {
-      setState(() => _voiceProblem = '들은 말씀에서 출발지와 목적지를 찾지 못했습니다.');
+      // 해석 결과가 비어 있어도 장소를 구분할 근거가 분명한 부분은 입력창에 남긴다.
+      // 남긴 글자는 확정되지 않은 부분 인식이므로 경로 검색으로 넘어가지 않고 기존 단계로 다시 묻는다.
+      final slot =
+          _awaitingSlot ??
+          (_origin.text.trim().isEmpty && !_voiceCurrentLocation
+              ? (_destination.text.trim().isEmpty ? 'both' : 'origin')
+              : 'destination');
+      final kept = _keepPartialPlaces(text);
+      setState(
+        () => _voiceProblem = kept
+            ? '들은 말씀에서 출발지와 목적지를 확인하지 못했습니다. 알아들은 장소는 입력창에 남겨 두었습니다.'
+            : '들은 말씀에서 출발지와 목적지를 찾지 못했습니다.',
+      );
+      if (kept) {
+        await _askAgain(
+          slot == 'both'
+              ? '어디에서 어디로 가시는지 말씀해 주세요.'
+              : slot == 'origin'
+              ? '어디에서 출발하시나요?'
+              : '어디로 가시나요?',
+          slot: slot,
+          heard: text,
+        );
+        return false;
+      }
     }
     // 이번 발화에서 말한 항목만 갱신하고, 말하지 않은 항목과 확정 장소는 그대로 둔다.
     // 코드에서 글자를 채우므로 입력창의 onChanged가 실행되지 않아 후보 목록과 자동 검색이 열리지 않는다.
@@ -872,11 +951,89 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return false;
   }
 
+  // 문장 해석에 실패했을 때 인식 문장에서 장소를 구분할 근거가 분명한 문자열만 꺼낸다.
+  // '~에서 ~로/까지' 같은 출발·도착 표현이 있거나, 한 항목만 물은 단계의 짧은 대답인 경우만 사용한다.
+  ({String? origin, String? destination}) _partialPlaces(String text) {
+    // 문장 끝의 부탁·어미 표현과 문장부호를 지워 장소 이름만 남긴다.
+    String clean(String value) {
+      var result = value.replaceAll(RegExp(r'[.,!?~…]'), ' ').trim();
+      // '~에서 출발해서 ~로'처럼 이어진 출발 표현은 목적지 이름에서 뺀다.
+      result = result.replaceFirst(RegExp(r'^(출발해서|출발하여|떠나서)\s*'), '');
+      result = result.replaceFirst(
+        RegExp(
+          r'\s*(가\s*주세요|가\s*줘|가고\s*싶어요?|가려고\s*해요?|가려고요|갈게요|갈래요|가요|가자|갑니다|출발할게요|출발해요|출발합니다|출발|이요|예요|이에요|입니다|요)$',
+        ),
+        '',
+      );
+      return result.replaceAll(RegExp(r'\s+'), ' ').trim();
+    }
+
+    // 장소로 보기 어려운 대답이나 지나치게 긴 문장은 버린다.
+    String? place(String value) {
+      final name = clean(value);
+      if (name.isEmpty ||
+          name.length > 20 ||
+          name.split(' ').length > 4 ||
+          RegExp(r'모르|몰라|아니|글쎄|뭐라|다시|취소|그만').hasMatch(name) ||
+          // 현재 위치를 뜻하는 말은 장소 이름으로 넣지 않는다.
+          RegExp(r'^(여기|거기|저기|이곳|지금\s?위치|현재\s?위치|내\s?위치)$').hasMatch(name)) {
+        return null;
+      }
+      return name;
+    }
+
+    final sentence = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    final both = RegExp(
+      r'^(.+?)\s*에서\s*(.+?)\s*(?:으로|로|까지)(?:\s|$)',
+    ).firstMatch(sentence);
+    if (both != null) {
+      return (origin: place(both[1]!), destination: place(both[2]!));
+    }
+    final from = RegExp(r'^(.+?)\s*에서\s*(?:출발|떠나)').firstMatch(sentence);
+    if (from != null) return (origin: place(from[1]!), destination: null);
+    final to = RegExp(
+      r'^(.+?)\s*(?:으로|로|까지)\s*(?:가|갈|데려|이동)',
+    ).firstMatch(sentence);
+    if (to != null) return (origin: null, destination: place(to[1]!));
+    // 구분 표현이 없으면 출발지 또는 목적지 하나만 물은 단계의 대답으로만 사용한다.
+    if (_awaitingSlot == 'origin') {
+      return (origin: place(sentence), destination: null);
+    }
+    if (_awaitingSlot == 'destination') {
+      return (origin: null, destination: place(sentence));
+    }
+    return (origin: null, destination: null);
+  }
+
+  // 해석 실패 시 꺼낸 장소 문자열을 비어 있는 입력창에만 넣는다. 확정 장소와 기존 글자는 덮어쓰지 않는다.
+  // 코드에서 채우므로 onChanged가 실행되지 않아 후보 목록·키보드·자동 경로 검색이 열리지 않는다.
+  bool _keepPartialPlaces(String text) {
+    final partial = _partialPlaces(text);
+    var kept = false;
+    if (partial.origin != null &&
+        _origin.text.trim().isEmpty &&
+        !_voiceCurrentLocation) {
+      _origin.text = partial.origin!;
+      kept = true;
+    }
+    if (partial.destination != null && _destination.text.trim().isEmpty) {
+      _destination.text = partial.destination!;
+      kept = true;
+    }
+    debugPrint(
+      '[EASY_BUS_VOICE] 부분 인식 보존=$kept 출발지=${partial.origin != null} '
+      '목적지=${partial.destination != null} 단계=${_awaitingSlot ?? '처음'}',
+    );
+    return kept;
+  }
+
   // 누락 장소 재질문은 화면과 TTS로 전달하며 인식 실패 횟수에 포함하지 않는다.
   Future<void> _askAgain(String question, {String? slot, String? heard}) async {
     var message = question;
     if (slot != null) {
       _awaitingSlot = slot;
+      // 출발지를 물은 경우 비어 있는 출발지로 자동 경로 검색을 하지 않는다.
+      _originRequested = slot == 'origin' || slot == 'both';
     }
     if (_voiceAttempts >= VoicePolicy.maxAttempts) {
       message = '$question 음성 입력 횟수를 모두 사용했습니다. 글자로 입력해 주세요.';
@@ -895,6 +1052,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _awaitingSlot = null;
     _voiceAttempts = 0;
     _voiceCurrentLocation = false;
+    _originRequested = false;
+    _uploadWithoutSpeech = false;
     _heard = '';
     _voiceProblem = null;
   }
@@ -1245,25 +1404,27 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       setState(() => _audioTransition = true);
       String? recordedPath;
       try {
-        // 음량을 관측하지 못한 기기에서는 무발화로 단정하지 않고 녹음 파일을 서버 음성 인식으로 확인한다.
+        // 음량 기반 감지는 녹음 시작·종료 시점 판단에만 사용한다.
+        // 감지하지 못했더라도 작은 목소리가 기록되었을 수 있으므로 완전 무음이 아니면 서버 음성 인식으로 확인한다.
+        // 자동 종료와 직접 종료가 모두 이 경로를 거치므로 같은 정책이 적용된다.
         final unavailable = _device.detectionUnavailable;
-        if (!_device.heardSpeech && unavailable) {
-          debugPrint('[EASY_BUS_VOICE] 음량 관측 불가: 녹음 파일을 서버 인식으로 확인');
+        final silent = !_device.heardSpeech && _device.silentInput;
+        _uploadWithoutSpeech = !_device.heardSpeech && !silent;
+        if (_uploadWithoutSpeech) {
+          debugPrint(
+            '[EASY_BUS_VOICE] 음량 기준 말소리 미감지: 녹음 파일을 서버 인식으로 확인 '
+            '(사유=${unavailable ? '음량 관측 불가' : '음량 기준 미달'})',
+          );
         }
-        if (!_device.heardSpeech && !unavailable) {
-          final silent = _device.silentInput;
+        if (silent) {
           await _device.cancelRecording();
           if (!_valid(id)) return;
-          if (silent) {
-            // 장치에서 소리가 전혀 들어오지 않은 경우는 사용자의 발화 실패로 세지 않는다.
-            debugPrint('[EASY_BUS_VOICE] 마이크 입력이 완전 무음: 기기 마이크 접근 설정 확인 필요');
-            setState(
-              () => _voiceProblem = '마이크에 소리가 전혀 들어오지 않습니다. 휴대전화 설정에서 마이크 사용이 켜져 있는지 확인한 뒤 다시 말하거나 글자로 입력해 주세요.',
-            );
-            _notice(_voiceProblem!);
-          } else {
-            await _voiceFailure('말소리가 감지되지 않았습니다.');
-          }
+          // 장치에서 소리가 전혀 들어오지 않은 경우는 사용자의 발화 실패로 세지 않는다.
+          debugPrint('[EASY_BUS_VOICE] 마이크 입력이 완전 무음: 서버 전송 없이 녹음 폐기, 기기 마이크 접근 설정 확인 필요');
+          setState(
+            () => _voiceProblem = '마이크에 소리가 전혀 들어오지 않습니다. 휴대전화 설정에서 마이크 사용이 켜져 있는지 확인한 뒤 다시 말하거나 글자로 입력해 주세요.',
+          );
+          _notice(_voiceProblem!);
           if (_valid(id)) {
             _loadingTimer?.cancel();
             setState(() {
@@ -1432,7 +1593,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   // 입력·음성 단계에서 돌아갈 이전 화면이 있을 때만 좌측 상단 뒤로 가기 버튼을 표시한다.
-  // 글자를 입력하는 중이거나 최초 기본 화면에서는 버튼을 표시하지 않는다.
+  // 최초 기본 화면에서도 입력창을 선택해 글자를 입력하는 중이거나 후보 목록이 열려 있으면 표시한다.
+  // 입력창 포커스가 없고 진행 중인 단계도 없는 기본 화면에서는 남아 있는 글자만으로 표시하지 않는다.
   bool get _inputBackVisible =>
       _busy ||
       _phase == HomePhase.recording ||
@@ -1440,7 +1602,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _route != null ||
       _editingInputs ||
       _voiceProblem != null ||
-      _heard.isNotEmpty;
+      _heard.isNotEmpty ||
+      _suggestOrigin != null ||
+      _originFocus.hasFocus ||
+      _destinationFocus.hasFocus;
 
   // 경로 결과 위의 새 입력을 마치고 기존 결과 화면으로 돌아가며, 비웠던 입력 상태를 복원한다.
   void _returnToResult() {
