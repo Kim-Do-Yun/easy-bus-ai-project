@@ -1,5 +1,8 @@
 import 'dart:async';
 
+import 'dart:math' as math;
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_naver_map/flutter_naver_map.dart';
 
@@ -94,6 +97,27 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     'SPEECH_FAILED',
   };
   Timer? _loadingTimer;
+  // 입력창 아래 장소 후보 목록 상태이다. true는 출발지, false는 목적지 아래에 표시하며 null이면 닫는다.
+  // 사용자가 직접 입력하거나 입력창을 선택한 경우에만 열고, 코드에서 채운 글자로는 열지 않는다.
+  bool? _suggestOrigin;
+  List<Place> _suggestions = const [];
+  bool _suggestLoading = false;
+  String? _suggestMessage;
+  Timer? _suggestTimer;
+  // 늦게 도착한 이전 검색어의 응답이 최신 목록을 덮어쓰지 않도록 요청 번호를 비교한다.
+  int _suggestRequest = 0;
+  static const _suggestDelay = Duration(milliseconds: 400);
+  // 앱의 현재 위치와 지도 마커이며 사용자가 지정한 출발지와 별도로 관리하여 경로 표시 중에도 유지한다.
+  Place? _currentPlace;
+  NMarker? _currentMarker;
+  // 경로 결과 위에서 새 음성 입력을 시작할 때 비운 입력 상태이며 뒤로 가기로 결과 화면에 돌아갈 때 복원한다.
+  ({
+    String origin,
+    String destination,
+    Place? originPlace,
+    Place? destinationPlace,
+  })?
+  _resultInputs;
   final List<NOverlayInfo> _routeOverlays = [];
   Future<void> _mapQueue = Future.value();
   // 화면 상태별 최초 빌드만 기록하여 재빌드 시 로그가 반복되지 않게 한다.
@@ -112,6 +136,174 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _origin.addListener(() => _releaseSelection(true));
     _destination.addListener(() => _releaseSelection(false));
+    _originFocus.addListener(() => _focusChanged(true));
+    _destinationFocus.addListener(() => _focusChanged(false));
+  }
+
+  bool get _inputLocked =>
+      _busy || _audioTransition || _phase == HomePhase.recording;
+
+  // 입력창 문구와 같은 이름의 장소가 후보 목록에서 확정되어 좌표가 있는 상태이다.
+  bool _confirmed(bool isOrigin) {
+    final place = isOrigin ? _originPlace : _destinationPlace;
+    return place != null &&
+        place.name == (isOrigin ? _origin : _destination).text.trim();
+  }
+
+  // 출발지는 장소 확정 외에 음성으로 '여기서'처럼 현재 위치 출발을 말한 경우도 확정으로 본다.
+  bool get _originReady =>
+      _confirmed(true) ||
+      (_voiceCurrentLocation && _origin.text.trim().isEmpty);
+  bool get _destinationReady => _confirmed(false);
+
+  // 자음·모음만 입력된 조합 중 글자로는 장소 검색을 하지 않는다.
+  static bool _onlyJamo(String text) =>
+      text.runes.every((r) => r >= 0x3131 && r <= 0x318E || r == 0x20);
+
+  // 사용자가 입력창을 선택하면 이미 있는 글자로 바로 후보를 찾고, 포커스가 빠지면 해당 목록만 닫는다.
+  void _focusChanged(bool isOrigin) {
+    if (!mounted) return;
+    final focus = isOrigin ? _originFocus : _destinationFocus;
+    if (focus.hasFocus) {
+      final text = (isOrigin ? _origin : _destination).text.trim();
+      if (!_inputLocked && text.isNotEmpty && !_confirmed(isOrigin)) {
+        _scheduleSuggestions(isOrigin, immediate: true);
+      } else if (_suggestOrigin != null && _suggestOrigin != isOrigin) {
+        _hideSuggestions();
+      }
+    } else if (_suggestOrigin == isOrigin) {
+      _hideSuggestions();
+    }
+  }
+
+  // 글자 입력마다 바로 호출하지 않고 입력이 멈춘 뒤 기존 장소 검색 API로 후보를 찾는다.
+  void _scheduleSuggestions(bool isOrigin, {bool immediate = false}) {
+    _suggestTimer?.cancel();
+    final query = (isOrigin ? _origin : _destination).text.trim();
+    final request = ++_suggestRequest;
+    if (query.isNotEmpty && _onlyJamo(query)) {
+      // 조합 중에는 이전 목록을 유지하고 진행 표시만 멈춘다.
+      if (_suggestLoading) setState(() => _suggestLoading = false);
+      return;
+    }
+    if (_inputLocked || query.isEmpty || _confirmed(isOrigin)) {
+      _hideSuggestions();
+      return;
+    }
+    setState(() {
+      if (_suggestOrigin != isOrigin) _suggestions = const [];
+      _suggestOrigin = isOrigin;
+      _suggestLoading = true;
+      _suggestMessage = null;
+    });
+    _suggestTimer = Timer(
+      immediate ? Duration.zero : _suggestDelay,
+      () => unawaited(_loadSuggestions(isOrigin, query, request)),
+    );
+  }
+
+  Future<void> _loadSuggestions(
+    bool isOrigin,
+    String query,
+    int request,
+  ) async {
+    // 그 사이 글자가 바뀌었거나 목록을 닫았거나 다른 작업이 시작되었으면 응답을 버린다.
+    bool current() =>
+        mounted &&
+        request == _suggestRequest &&
+        _suggestOrigin == isOrigin &&
+        (isOrigin ? _origin : _destination).text.trim() == query &&
+        !_inputLocked;
+    if (!current()) return;
+    try {
+      final places = await _api.locations(query);
+      if (!current()) return;
+      setState(() {
+        _suggestions = places;
+        _suggestLoading = false;
+        _suggestMessage = places.isEmpty ? '검색 결과가 없습니다.' : null;
+      });
+    } catch (error) {
+      if (!current()) return;
+      // 실패해도 입력한 글자와 확정 장소는 그대로 두고 목록 안에서만 안내한다.
+      setState(() {
+        _suggestions = const [];
+        _suggestLoading = false;
+        _suggestMessage =
+            error is ApiException && error.code == 'LOCATION_NOT_FOUND'
+            ? '검색 결과가 없습니다. 이름을 자세히 입력해 주세요.'
+            : '장소 후보를 불러오지 못했습니다. 잠시 후 다시 입력해 주세요.';
+      });
+    }
+  }
+
+  void _hideSuggestions() {
+    _suggestTimer?.cancel();
+    ++_suggestRequest;
+    if (_suggestOrigin == null && !_suggestLoading) return;
+    if (!mounted) return;
+    setState(() {
+      _suggestOrigin = null;
+      _suggestions = const [];
+      _suggestLoading = false;
+      _suggestMessage = null;
+    });
+  }
+
+  // 입력창 아래 후보에서 장소를 고르면 좌표를 확정하고, 두 장소가 모두 확정되면 경로를 한 번 검색한다.
+  Future<void> _selectSuggestion(Place place, bool isOrigin) async {
+    if (_inputLocked) return;
+    _hideSuggestions();
+    final generation = _request;
+    try {
+      await _confirmPlace(place, isOrigin);
+    } catch (_) {
+      /* 지도 마커 표시 실패는 좌표 확정을 막지 않는다. */
+    }
+    if (!mounted || generation != _request) return;
+    setState(() {
+      _voiceAttempts = 0;
+      _voiceProblem = null;
+      if (isOrigin) _voiceCurrentLocation = false;
+      _awaitingSlot = !_originReady
+          ? 'origin'
+          : !_destinationReady
+          ? 'destination'
+          : null;
+    });
+    if (_originReady && _destinationReady) {
+      FocusScope.of(context).unfocus();
+      await _search();
+      return;
+    }
+    // 아직 확정하지 않은 다른 입력창으로 이동하며, 글자가 있으면 그 글자로 후보를 바로 보여 준다.
+    (_originReady ? _destinationFocus : _originFocus).requestFocus();
+  }
+
+  // 확정되지 않은 입력창의 후보 목록을 연다. 이미 포커스가 있으면 바로 검색한다.
+  void _openSuggestionsFor(bool isOrigin) {
+    final focus = isOrigin ? _originFocus : _destinationFocus;
+    if (focus.hasFocus) {
+      _scheduleSuggestions(isOrigin, immediate: true);
+    } else {
+      focus.requestFocus();
+    }
+  }
+
+  // 검색 버튼은 확정되지 않은 장소만 후보에서 고르게 하고, 모두 확정되었으면 다시 고르지 않고 바로 검색한다.
+  void _manualSearch() {
+    if (_inputLocked) return;
+    if (_origin.text.trim().isNotEmpty && !_confirmed(true)) {
+      _openSuggestionsFor(true);
+      return;
+    }
+    if (_destination.text.trim().isNotEmpty && !_confirmed(false)) {
+      _openSuggestionsFor(false);
+      return;
+    }
+    _hideSuggestions();
+    FocusScope.of(context).unfocus();
+    unawaited(_search());
   }
 
   // 확정한 장소명과 입력 문구가 달라지면 이전 좌표와 선택 마커를 쓰지 않는다.
@@ -201,35 +393,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await task;
   }
 
-  // 입력창에서 검색 키를 누르면 후보를 찾아 선택만 하고, 경로 검색은 출발지·목적지 확정 후 수행한다.
-  Future<void> _pickPlace(bool isOrigin) async {
-    if (_busy || _audioTransition || _phase == HomePhase.recording) return;
+  // 입력창에서 키보드의 다음·검색 키를 누르면 확정되지 않은 장소의 후보 목록을 바로 보여 준다.
+  void _submitInput(bool isOrigin) {
+    if (_inputLocked) return;
     final text = (isOrigin ? _origin : _destination).text.trim();
-    // 출발지를 비우면 기존 GPS 출발 분기를 그대로 사용한다.
-    if (text.isEmpty) {
-      if (!isOrigin) _notice('목적지를 입력해 주세요.');
-      return;
-    }
-    final id = _begin('장소를 찾고 있어요.');
-    try {
-      final place = await _resolve(text, id, isOrigin ? '출발지' : '목적지');
-      if (!_valid(id) || place == null) return;
-      await _confirmPlace(place, isOrigin);
-      if (!_valid(id)) return;
-      setState(() {
-        _voiceAttempts = 0;
-        _voiceProblem = null;
-      });
-    } catch (error) {
-      if (_valid(id)) _notice(error);
-    } finally {
-      if (_valid(id)) {
-        _loadingTimer?.cancel();
-        setState(() {
-          _loading = false;
-          _phase = _route == null ? HomePhase.map : HomePhase.guidance;
-        });
-      }
+    if (text.isNotEmpty && !_confirmed(isOrigin)) {
+      _scheduleSuggestions(isOrigin, immediate: true);
+    } else if (isOrigin) {
+      // 출발지를 비우거나 이미 확정했으면 목적지 입력으로 넘어간다.
+      _destinationFocus.requestFocus();
+    } else if (text.isEmpty) {
+      _notice('목적지를 입력해 주세요.');
+    } else {
+      _manualSearch();
     }
   }
 
@@ -251,9 +427,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _voiceFailure(String message) async {
     if (!mounted) return;
     _voiceAttempts++;
+    debugPrint(
+      '[EASY_BUS_VOICE] 음성 입력 실패 $_voiceAttempts/${VoicePolicy.maxAttempts}회 '
+      '단계=${_awaitingSlot ?? '처음'}',
+    );
     final guidance = _voiceAttempts >= VoicePolicy.maxAttempts
-        ? '$message 화면에서 장소를 고르거나 글자로 입력해 주세요.'
-        : '$message 다시 말하거나 화면에서 고르거나 글자로 입력해 주세요.';
+        ? '$message 음성 입력 횟수를 모두 사용했습니다. 글자로 입력해 주세요.'
+        : '$message 다시 말하거나 글자로 입력해 주세요.';
     setState(() => _voiceProblem = guidance);
     _notice(guidance);
     try {
@@ -263,126 +443,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  // 음성으로 일부 인식한 글자는 그대로 두고 글자 입력으로 전환한다.
+  // 확정되지 않은 입력창부터 선택하며, 글자가 있으면 선택 시점에 그 글자로 후보 목록을 보여 준다.
   void _typeInstead() {
     if (_busy || _audioTransition) return;
     setState(() {
       _editingInputs = true;
       _voiceProblem = null;
     });
-    final origin =
-        _awaitingSlot == 'origin' ||
-        (_origin.text.isEmpty && !_voiceCurrentLocation);
+    final origin = !_originReady;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) (origin ? _originFocus : _destinationFocus).requestFocus();
     });
-  }
-
-  // 부분 인식 문자열을 수정해 기존 후보 검색으로 연결한다. 후보의 역할은 사용자가 지정한다.
-  Future<void> _chooseInstead() async {
-    if (_busy || _audioTransition) return;
-    final generation = _request;
-    var query = _awaitingSlot == 'origin'
-        ? _origin.text
-        : _awaitingSlot == 'destination'
-        ? _destination.text
-        : _heard;
-    if (query.trim().isEmpty) query = _heard;
-    final choice = await showModalBottomSheet<({bool origin, String query})>(
-      context: context,
-      isScrollControlled: true,
-      builder: (sheetContext) => SafeArea(
-        child: Padding(
-          padding: EdgeInsets.fromLTRB(
-            20,
-            20,
-            20,
-            MediaQuery.viewInsetsOf(sheetContext).bottom + 20,
-          ),
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Text('찾을 장소를 확인해 주세요', style: TextStyle(fontSize: 22)),
-                TextFormField(
-                  initialValue: query,
-                  onChanged: (value) => query = value,
-                  style: const TextStyle(fontSize: 20),
-                  decoration: const InputDecoration(hintText: '장소 이름 입력'),
-                ),
-                for (final origin in [true, false])
-                  Padding(
-                    padding: const EdgeInsets.only(top: 12),
-                    child: SizedBox(
-                      width: double.infinity,
-                      height: 56,
-                      child: FilledButton(
-                        onPressed: () {
-                          if (query.trim().isNotEmpty) {
-                            Navigator.pop(sheetContext, (
-                              origin: origin,
-                              query: query.trim(),
-                            ));
-                          }
-                        },
-                        child: Text(
-                          origin ? '출발지 후보 보기' : '목적지 후보 보기',
-                          style: const TextStyle(fontSize: 20),
-                        ),
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-    if (!_valid(generation) || choice == null) return;
-    (choice.origin ? _origin : _destination).text = choice.query;
-    _awaitingSlot = choice.origin ? 'origin' : 'destination';
-    _editingInputs = true;
-    final id = _begin('장소를 찾고 있어요.');
-    var confirmed = false;
-    try {
-      final place = await _resolve(
-        choice.query,
-        id,
-        choice.origin ? '출발지' : '목적지',
-      );
-      if (!_valid(id) || place == null) return;
-      await _confirmPlace(place, choice.origin);
-      if (!_valid(id)) return;
-      confirmed = true;
-      setState(() {
-        _editingInputs = true;
-        _voiceProblem = null;
-        _voiceAttempts = 0;
-        if (choice.origin) _voiceCurrentLocation = false;
-        _awaitingSlot = _origin.text.isEmpty && !_voiceCurrentLocation
-            ? 'origin'
-            : _destination.text.isEmpty
-            ? 'destination'
-            : null;
-      });
-    } catch (error) {
-      if (_valid(id)) {
-        _notice(error);
-        setState(() => _voiceProblem = error.toString());
-      }
-    } finally {
-      if (_valid(id)) {
-        _loadingTimer?.cancel();
-        setState(() {
-          _loading = false;
-          _phase = HomePhase.map;
-        });
-      }
-    }
-    if (confirmed &&
-        _valid(id) &&
-        _destination.text.isNotEmpty &&
-        (_origin.text.isNotEmpty || _voiceCurrentLocation))
-      await _search();
   }
 
   Future<void> _prepareMap(NaverMapController controller) async {
@@ -392,7 +464,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _map = controller;
     final generation = _request;
     final stageElapsed = Stopwatch()..start();
-    var stage = 'GPS 조회';
+    var stage = LocationPolicy.useFixed ? '고정 현재 위치 조회' : 'GPS 조회';
     try {
       debugPrint('[EASY_BUS_INIT] $stage 시작');
       final position = await _device.currentPosition();
@@ -402,13 +474,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (!mounted) return;
       stage = '현재 위치 지도 반영';
       stageElapsed.reset();
-      await controller.addOverlay(
-        NMarker(
-          id: 'current',
-          position: _latLng(position),
-          caption: const NOverlayCaption(text: '현재 위치'),
-        ),
-      );
+      _currentPlace = position;
+      await _showCurrentMarker(position);
       if (generation == _request)
         await controller.updateCamera(
           NCameraUpdate.scrollAndZoomTo(target: _latLng(position), zoom: 15),
@@ -443,6 +510,52 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (_valid(generation)) _notice(error);
     }
   }
+
+  // 기존 현재 위치 마커 모양을 그대로 쓰되, 경로 마커보다 아래에 그리고 겹치는 글자는 숨긴다.
+  NMarker _currentMarkerFor(Place place) => NMarker(
+    id: 'current',
+    position: _latLng(place),
+    caption: const NOverlayCaption(text: '현재 위치'),
+    isHideCollidedCaptions: true,
+  )..setGlobalZIndex(190000);
+
+  // 현재 위치 마커는 경로 오버레이 목록과 별도로 관리하여 경로 교체·삭제 시 함께 지워지지 않는다.
+  Future<void> _showCurrentMarker(Place place) {
+    final task = _mapQueue.then((_) async {
+      if (!mounted || _map == null) return;
+      final marker = _currentMarkerFor(place);
+      // 같은 id의 오버레이를 추가하면 지도 SDK가 이전 현재 위치 마커를 교체한다.
+      await _map!.addOverlay(marker);
+      _currentMarker = marker;
+    });
+    _mapQueue = task.catchError((Object error) {});
+    return task;
+  }
+
+  // 현재 위치 버튼: 고정 위치 모드에서는 원주시 중앙 좌표로 이동하고 경로 화면 맞춤과 별개로 동작한다.
+  Future<void> _moveToCurrent() async {
+    try {
+      final place = await _device.currentPosition();
+      if (!mounted) return;
+      _currentPlace = place;
+      await _showCurrentMarker(place);
+      final task = _mapQueue.then((_) async {
+        if (!mounted || _map == null) return;
+        await _map!.updateCamera(
+          NCameraUpdate.scrollAndZoomTo(target: _latLng(place), zoom: 16),
+        );
+      });
+      _mapQueue = task.catchError((Object error) {});
+      await task;
+    } catch (error) {
+      _notice(error);
+    }
+  }
+
+  // 약 15m 이내이면 같은 지점으로 보고 경로 출발 마커에 현재 위치임을 함께 표시한다.
+  bool _samePoint(Place a, Place b) =>
+      (a.latitude - b.latitude).abs() < 0.00014 &&
+      (a.longitude - b.longitude).abs() < 0.00017;
 
   NLatLng _latLng(Place p) => NLatLng(p.latitude, p.longitude);
 
@@ -502,13 +615,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                             style: const TextStyle(fontSize: 20),
                           ),
                           // 장소 구분과 주소(정류장은 정류장 번호)를 표시하고, 둘 다 없으면 기존처럼 좌표를 보여 준다.
-                          subtitle: Text(
-                            p.tagoId != null || p.kind == 'STOP'
-                                ? '버스 정류장${p.arsId != null ? ' · 정류장 번호 ${p.arsId}' : ''}'
-                                : p.address != null
-                                ? '${p.kind == 'PLACE' ? '장소' : '주소'} · ${p.address}'
-                                : '${p.latitude}, ${p.longitude}',
-                          ),
+                          subtitle: Text(_placeSubtitle(p)),
                           onTap: () => Navigator.pop(context, p),
                         ),
                       )
@@ -613,6 +720,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (!_valid(id)) return;
       // 경로를 받으면 음성 대화를 마치고 다음 음성 입력은 새 경로 요청으로 본다.
       _resetVoice();
+      _resultInputs = null;
       setState(() {
         _editingInputs = false;
         _status = '경로를 찾았습니다.';
@@ -713,12 +821,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
     if (!_valid(id)) return false;
     _voiceActive = true;
+    debugPrint(
+      '[EASY_BUS_VOICE] 해석 결과 시도=$_voiceAttempts/${VoicePolicy.maxAttempts} '
+      '출발지=${result.origin != null} 목적지=${result.destination != null} '
+      '현재위치=${result.useCurrentLocation}'
+      '${kDebugMode ? ' (출발="${result.origin ?? ''}", 도착="${result.destination ?? ''}")' : ''}',
+    );
     if (result.origin == null &&
         result.destination == null &&
         !result.useCurrentLocation) {
-      setState(() => _voiceProblem = '들은 말씀에서 장소를 골라 주세요.');
+      setState(() => _voiceProblem = '들은 말씀에서 출발지와 목적지를 찾지 못했습니다.');
     }
     // 이번 발화에서 말한 항목만 갱신하고, 말하지 않은 항목과 확정 장소는 그대로 둔다.
+    // 코드에서 글자를 채우므로 입력창의 onChanged가 실행되지 않아 후보 목록과 자동 검색이 열리지 않는다.
     if (result.useCurrentLocation) {
       _origin.text = '';
       _voiceCurrentLocation = true;
@@ -764,7 +879,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _awaitingSlot = slot;
     }
     if (_voiceAttempts >= VoicePolicy.maxAttempts) {
-      message = '$question 화면에서 고르거나 글자로 입력해 주세요.';
+      message = '$question 음성 입력 횟수를 모두 사용했습니다. 글자로 입력해 주세요.';
       setState(() => _voiceProblem = message);
     }
     _notice(heard == null ? message : '"$heard"\n$message');
@@ -787,7 +902,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // 음성 대화에서 현재 위치를 확인하지 못하면 임의 좌표 없이 출발지를 다시 묻는다.
   Future<Place?> _currentOrigin(int id, bool voice) async {
     try {
-      return await _device.currentPosition();
+      // 고정 위치 모드에서는 원주시 중앙 좌표가 반환되며 현재 위치 마커와 같은 값을 사용한다.
+      final place = await _device.currentPosition();
+      if (_valid(id) && _currentPlace == null) {
+        _currentPlace = place;
+        unawaited(_showCurrentMarker(place));
+      }
+      return place;
     } catch (error) {
       if (!_valid(id)) return null;
       _voiceCurrentLocation = false;
@@ -909,6 +1030,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             segments.first.start,
             '출발',
             EasyColors.primaryContainer,
+            // 출발지가 현재 위치와 같으면 겹친 현재 위치 마커 대신 출발 마커에 함께 표시한다.
+            _currentPlace != null &&
+                    _samePoint(segments.first.start, _currentPlace!)
+                ? '현재 위치'
+                : null,
           );
         if (segments.last.type == 'WALK')
           await marker(
@@ -1019,6 +1145,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             _notice('이전 지도 표시 일부를 지우지 못했습니다. 뒤로 가기를 눌러 주세요.');
           }
         }
+        // 경로를 교체한 뒤에도 현재 위치 마커가 지도에 남아 있도록 확인하고, 없으면 다시 표시한다.
+        final current = _currentPlace;
+        if (current != null &&
+            (_currentMarker == null || !_currentMarker!.isAdded)) {
+          try {
+            final marker = _currentMarkerFor(current);
+            await _map!.addOverlay(marker);
+            _currentMarker = marker;
+          } catch (_) {
+            /* 현재 위치 마커 표시 실패는 경로 결과를 바꾸지 않는다. */
+          }
+        }
         // 선택한 경로 전체가 상단 안내와 마이크 버튼에 가리지 않도록 화면을 맞춘다.
         if (mounted && _valid(id) && points.length >= 2) {
           final inset = MediaQuery.paddingOf(context);
@@ -1095,6 +1233,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
       ),
     );
+    // 상세 화면에서 재생하던 안내는 결과 화면으로 돌아오면 멈춘다.
+    unawaited(_device.stopSpeaking().catchError((Object _) {}));
   }
 
   Future<void> _microphone() async {
@@ -1105,14 +1245,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       setState(() => _audioTransition = true);
       String? recordedPath;
       try {
-        if (!_device.heardSpeech) {
-          final unavailable = _device.detectionUnavailable;
+        // 음량을 관측하지 못한 기기에서는 무발화로 단정하지 않고 녹음 파일을 서버 음성 인식으로 확인한다.
+        final unavailable = _device.detectionUnavailable;
+        if (!_device.heardSpeech && unavailable) {
+          debugPrint('[EASY_BUS_VOICE] 음량 관측 불가: 녹음 파일을 서버 인식으로 확인');
+        }
+        if (!_device.heardSpeech && !unavailable) {
+          final silent = _device.silentInput;
           await _device.cancelRecording();
           if (!_valid(id)) return;
-          if (unavailable) {
+          if (silent) {
+            // 장치에서 소리가 전혀 들어오지 않은 경우는 사용자의 발화 실패로 세지 않는다.
+            debugPrint('[EASY_BUS_VOICE] 마이크 입력이 완전 무음: 기기 마이크 접근 설정 확인 필요');
             setState(
-              () => _voiceProblem =
-                  '마이크 음량을 확인하지 못했습니다. 다시 말하거나 다른 입력 방법을 선택해 주세요.',
+              () => _voiceProblem = '마이크에 소리가 전혀 들어오지 않습니다. 휴대전화 설정에서 마이크 사용이 켜져 있는지 확인한 뒤 다시 말하거나 글자로 입력해 주세요.',
             );
             _notice(_voiceProblem!);
           } else {
@@ -1148,11 +1294,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     } else {
       if (_voiceAttempts >= VoicePolicy.maxAttempts) {
-        setState(() => _voiceProblem = '화면에서 장소를 고르거나 글자로 입력해 주세요.');
+        setState(() => _voiceProblem = '음성 입력 횟수를 모두 사용했습니다. 글자로 입력해 주세요.');
         return;
       }
+      // 녹음 중 키보드와 후보 목록이 열려 있지 않도록 닫는다.
+      _hideSuggestions();
+      FocusScope.of(context).unfocus();
+      debugPrint(
+        '[EASY_BUS_VOICE] 음성 입력 시작 시도=${_voiceAttempts + 1}/${VoicePolicy.maxAttempts} '
+        '단계=${_awaitingSlot ?? '처음'}',
+      );
       // 기존 결과는 지도에 유지하되 새 음성 대화에 이전 장소를 섞지 않는다.
       if (!_voiceActive && _route != null && !_editingInputs) {
+        // 비우기 전 입력 상태를 보관해 뒤로 가기로 결과 화면에 돌아갈 때 복원한다.
+        _resultInputs = (
+          origin: _origin.text,
+          destination: _destination.text,
+          originPlace: _originPlace,
+          destinationPlace: _destinationPlace,
+        );
         _origin.clear();
         _destination.clear();
         _resetVoice();
@@ -1198,6 +1358,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   void _cancelRequest() {
     ++_request;
+    _hideSuggestions();
     _api.cancelRequests();
     // 취소된 요청의 후보 창만 닫으며 다른 화면을 잘못 pop하지 않는다.
     final sheet = _placeSheet;
@@ -1230,6 +1391,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
       return;
     }
+    _hideSuggestions();
+    FocusScope.of(context).unfocus();
+    // 경로 결과 위에서 입력 중이면 경로를 지우지 않고 결과 화면으로 돌아간다.
+    if (_route != null && _editingInputs) {
+      _returnToResult();
+      return;
+    }
+    // 경로가 없는 입력·음성 단계에서는 기본 지도 화면으로 돌아가며 입력한 글자와 확정 장소는 유지한다.
+    if (_route == null) {
+      _leaveInput();
+      return;
+    }
     ++_request;
     _resetVoice();
     setState(() {
@@ -1256,6 +1429,59 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     } catch (error) {
       _notice('음성 안내를 중지하지 못했습니다.');
     }
+  }
+
+  // 입력·음성 단계에서 돌아갈 이전 화면이 있을 때만 좌측 상단 뒤로 가기 버튼을 표시한다.
+  // 글자를 입력하는 중이거나 최초 기본 화면에서는 버튼을 표시하지 않는다.
+  bool get _inputBackVisible =>
+      _busy ||
+      _phase == HomePhase.recording ||
+      _phase == HomePhase.attention ||
+      _route != null ||
+      _editingInputs ||
+      _voiceProblem != null ||
+      _heard.isNotEmpty;
+
+  // 경로 결과 위의 새 입력을 마치고 기존 결과 화면으로 돌아가며, 비웠던 입력 상태를 복원한다.
+  void _returnToResult() {
+    ++_request;
+    final saved = _resultInputs;
+    _resultInputs = null;
+    setState(() {
+      _resetVoice();
+      _editingInputs = false;
+      _phase = HomePhase.guidance;
+    });
+    if (saved != null) {
+      for (final isOrigin in [true, false]) {
+        final place = isOrigin ? saved.originPlace : saved.destinationPlace;
+        final text = isOrigin ? saved.origin : saved.destination;
+        if (place != null && place.name == text.trim()) {
+          // 경로 표시 중에는 선택 마커를 숨긴 상태로 다시 확정하고 지도 화면은 움직이지 않는다.
+          unawaited(
+            _confirmPlace(
+              place,
+              isOrigin,
+              moveCamera: false,
+            ).catchError((Object _) {}),
+          );
+        } else {
+          (isOrigin ? _origin : _destination).text = text;
+        }
+      }
+    }
+    unawaited(_device.stopSpeaking().catchError((Object _) {}));
+  }
+
+  // 음성 대화·글자 입력 단계를 마치고 기본 지도 화면으로 돌아간다.
+  void _leaveInput() {
+    ++_request;
+    setState(() {
+      _resetVoice();
+      _editingInputs = false;
+      _phase = HomePhase.map;
+    });
+    unawaited(_device.stopSpeaking().catchError((Object _) {}));
   }
 
   @override
@@ -1286,6 +1512,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     ++_request;
     WidgetsBinding.instance.removeObserver(this);
     _loadingTimer?.cancel();
+    _suggestTimer?.cancel();
     _api.dispose();
     unawaited(_device.dispose().catchError((Object error) {}));
     _origin.dispose();
@@ -1307,7 +1534,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       );
     }
     return PopScope(
-      canPop: !_busy && _phase != HomePhase.recording && _route == null,
+      // 후보 목록·입력 단계·경로 결과가 있으면 앱을 닫지 않고 화면의 뒤로 가기와 같은 동작을 한다.
+      canPop: !_inputBackVisible && _suggestOrigin == null,
       onPopInvokedWithResult: (didPop, result) {
         if (!didPop) _back();
       },
@@ -1318,6 +1546,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           children: [
             NaverMap(
               key: const ValueKey('persistent-map'),
+              // 고정 위치 모드에서는 최초 지도 중심을 기본값(서울) 대신 원주시 중앙 좌표로 시작한다.
+              options: LocationPolicy.useFixed
+                  ? NaverMapViewOptions(
+                      initialCameraPosition: NCameraPosition(
+                        target: _latLng(LocationPolicy.fixedPlace),
+                        zoom: 15,
+                      ),
+                    )
+                  : const NaverMapViewOptions(),
               onMapReady: _prepareMap,
             ),
             SafeArea(
@@ -1343,6 +1580,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         ),
                       ),
                     ),
+            ),
+            // 현재 위치 이동 버튼은 마이크 버튼과 같은 높이의 우측에 두어 입력창·안내 카드와 겹치지 않게 한다.
+            SafeArea(
+              child: Align(
+                alignment: Alignment.bottomRight,
+                child: Padding(
+                  padding: const EdgeInsets.only(right: 16, bottom: 36),
+                  child: _circleButton(
+                    icon: Icons.my_location,
+                    label: '현재 위치로 이동',
+                    onTap: () => unawaited(_moveToCurrent()),
+                  ),
+                ),
+              ),
             ),
             if (_loading)
               Positioned.fill(
@@ -1445,6 +1696,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 : _destinationFocus,
             enabled: !_busy && _phase != HomePhase.recording,
             textInputAction: action,
+            // 키보드 완료 키가 포커스를 옮기지 않게 하고 후보 목록 표시는 onSubmitted에서 처리한다.
+            onEditingComplete: () {},
+            // 포커스가 남은 입력창을 다시 눌러도 닫힌 후보 목록을 기존 글자로 다시 보여 준다.
+            onTap: () {
+              final isOrigin = identical(controller, _origin);
+              if (_suggestOrigin != isOrigin &&
+                  controller.text.trim().isNotEmpty &&
+                  !_confirmed(isOrigin)) {
+                _scheduleSuggestions(isOrigin, immediate: true);
+              }
+            },
             onSubmitted: onSubmitted,
             onChanged: (_) {
               // 입력 방법만 바꿔 한도를 우회하지 않고 실제로 글자를 고쳤을 때 새 입력으로 본다.
@@ -1461,6 +1723,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     ? 'destination'
                     : null;
               });
+              // 사용자가 직접 고친 글자에만 후보 검색을 예약한다. 코드에서 채운 글자는 이 콜백을 거치지 않는다.
+              _scheduleSuggestions(identical(controller, _origin));
             },
             style: const TextStyle(
               fontSize: 18,
@@ -1490,7 +1754,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     children: [
       Row(
         children: [
-          if (_busy || _phase == HomePhase.recording) ...[
+          if (_inputBackVisible) ...[
             _circleButton(icon: Icons.arrow_back, label: '뒤로 가기', onTap: _back),
             const SizedBox(width: 8),
           ],
@@ -1517,8 +1781,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ),
               hint: '출발지를 입력하세요',
               action: TextInputAction.next,
-              // 출발지 입력을 마치면 후보를 골라 지도에서 위치를 확인한다.
-              onSubmitted: (_) => _pickPlace(true),
+              // 출발지 입력을 마치면 입력창 아래 후보를 골라 지도에서 위치를 확인한다.
+              onSubmitted: (_) => _submitInput(true),
               trailing: const Tooltip(
                 message: '비워 두면 현재 위치에서 출발합니다',
                 child: Padding(
@@ -1535,6 +1799,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ),
         ],
       ),
+      if (_suggestOrigin == true) _suggestionList(true),
       const SizedBox(height: 8),
       _inputBox(
         controller: _destination,
@@ -1545,27 +1810,122 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
         hint: '도착지를 입력하세요',
         action: TextInputAction.search,
-        // 목적지가 확정되지 않았으면 먼저 후보를 골라 위치를 확인하고, 확정된 뒤에는 기존 경로 검색을 수행한다.
-        onSubmitted: (_) =>
-            _destinationPlace != null &&
-                _destinationPlace!.name == _destination.text.trim()
-            ? _search()
-            : _pickPlace(false),
+        // 목적지가 확정되지 않았으면 입력창 아래 후보를 보여 주고, 확정된 뒤에는 기존 경로 검색을 수행한다.
+        onSubmitted: (_) => _submitInput(false),
         trailing: IconButton(
           onPressed: _busy || _phase == HomePhase.recording
               ? null
-              : () {
-                  FocusScope.of(context).unfocus();
-                  _search();
-                },
+              : _manualSearch,
           tooltip: '검색',
           iconSize: 28,
           color: EasyColors.primaryContainer,
           icon: const Icon(Icons.search),
         ),
       ),
+      if (_suggestOrigin == false) _suggestionList(false),
     ],
   );
+
+  // 후보의 장소 구분과 주소(정류장은 정류장 번호)를 표시하고, 둘 다 없으면 기존처럼 좌표를 보여 준다.
+  String _placeSubtitle(Place p) => p.tagoId != null || p.kind == 'STOP'
+      ? '버스 정류장${p.arsId != null ? ' · 정류장 번호 ${p.arsId}' : ''}'
+      : p.address != null
+      ? '${p.kind == 'PLACE' ? '장소' : '주소'} · ${p.address}'
+      : '${p.latitude}, ${p.longitude}';
+
+  // 입력창 바로 아래의 장소 후보 목록이며 키보드 위 남은 화면 안에서만 펼쳐 다른 입력창을 가리지 않는다.
+  Widget _suggestionList(bool isOrigin) {
+    final media = MediaQuery.of(context);
+    // 상단 여백, 입력창 두 개와 간격을 뺀 키보드 위 영역을 최대 높이로 사용한다.
+    final available =
+        media.size.height -
+        media.viewInsets.bottom -
+        media.padding.top -
+        12 -
+        58 * 2 -
+        8 -
+        24;
+    final maxHeight = math.max(
+      120.0,
+      math.min(available, media.size.height * 0.45),
+    );
+    final Widget content;
+    if (_suggestions.isEmpty) {
+      content = Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            if (_suggestLoading) ...[
+              const SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(
+                  strokeWidth: 3,
+                  color: EasyColors.primaryContainer,
+                ),
+              ),
+              const SizedBox(width: 12),
+            ],
+            Expanded(
+              child: Text(
+                _suggestLoading
+                    ? '장소를 찾고 있어요.'
+                    : _suggestMessage ?? '검색 결과가 없습니다.',
+                style: const TextStyle(
+                  fontSize: 18,
+                  color: EasyColors.onSurfaceVariant,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    } else {
+      content = ListView.separated(
+        shrinkWrap: true,
+        padding: EdgeInsets.zero,
+        itemCount: _suggestions.length,
+        separatorBuilder: (_, _) =>
+            const Divider(height: 1, color: EasyColors.surfaceContainerHigh),
+        itemBuilder: (_, index) {
+          final place = _suggestions[index];
+          return ListTile(
+            minVerticalPadding: 12,
+            title: Text(
+              place.name,
+              style: const TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w600,
+                color: EasyColors.onSurface,
+              ),
+            ),
+            subtitle: Text(
+              _placeSubtitle(place),
+              style: const TextStyle(
+                fontSize: 15,
+                color: EasyColors.onSurfaceVariant,
+              ),
+            ),
+            onTap: () => unawaited(_selectSuggestion(place, isOrigin)),
+          );
+        },
+      );
+    }
+    // 목록을 누를 때 입력창 바깥 탭으로 처리되어 키보드가 닫히지 않도록 같은 입력 영역으로 묶는다.
+    return TextFieldTapRegion(
+      child: Container(
+        margin: const EdgeInsets.only(top: 6),
+        constraints: BoxConstraints(maxHeight: maxHeight),
+        decoration: BoxDecoration(
+          color: EasyColors.white,
+          borderRadius: BorderRadius.circular(14),
+          boxShadow: EasyColors.cardShadow,
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Material(type: MaterialType.transparency, child: content),
+      ),
+    );
+  }
 
   Widget _circleButton({
     required IconData icon,
@@ -1949,24 +2309,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       '들은 말씀: $_heard',
                       style: const TextStyle(fontSize: 18),
                     ),
+                  // 최대 횟수(3회)를 모두 실패하면 다시 말하기는 제공하지 않고 글자 입력만 안내한다.
                   for (final item in <({String label, VoidCallback? action})>[
-                    (
-                      label: _voiceAttempts >= VoicePolicy.maxAttempts
-                          ? '다시 말하기 (시도 완료)'
-                          : '다시 말하기',
-                      action: _voiceAttempts >= VoicePolicy.maxAttempts
-                          ? null
-                          : () {
-                              unawaited(_microphone());
-                            },
-                    ),
-                    (
-                      label: '화면에서 고르기',
-                      action: () {
-                        unawaited(_chooseInstead());
-                      },
-                    ),
-                    (label: '글자로 입력', action: _typeInstead),
+                    if (_voiceAttempts < VoicePolicy.maxAttempts)
+                      (
+                        label: '다시 말하기',
+                        action: () {
+                          unawaited(_microphone());
+                        },
+                      ),
+                    (label: '글자로 입력하기', action: _typeInstead),
                   ])
                     Padding(
                       padding: const EdgeInsets.only(top: 8),
