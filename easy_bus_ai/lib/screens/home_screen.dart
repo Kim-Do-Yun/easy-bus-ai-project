@@ -882,9 +882,40 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       '현재위치=${result.useCurrentLocation}'
       '${kDebugMode ? ' (출발="${result.origin ?? ''}", 도착="${result.destination ?? ''}")' : ''}',
     );
-    if (result.origin == null &&
-        result.destination == null &&
-        !result.useCurrentLocation) {
+    var origin = result.origin;
+    var destination = result.destination;
+    // 해석 결과가 한 항목만 비었을 때 원문의 '~에서', '~로/까지' 같은 분명한 표현으로만 빠진 항목을 보완한다.
+    final marked = _partialPlaces(text, markedOnly: true);
+    bool same(String? a, String? b) =>
+        a != null &&
+        b != null &&
+        a.replaceAll(RegExp(r'\s+'), '') == b.replaceAll(RegExp(r'\s+'), '');
+    // 원문 표현과 해석 결과의 출발·도착이 뒤바뀌면 어느 쪽도 쓰지 않고 해당 항목만 다시 묻는다.
+    final conflict =
+        same(marked.origin, destination) || same(marked.destination, origin);
+    if (conflict) {
+      if (same(marked.origin, destination)) destination = null;
+      if (same(marked.destination, origin)) origin = null;
+    }
+    final fillOrigin = !conflict && origin == null && !result.useCurrentLocation
+        ? marked.origin
+        : null;
+    final fillDestination = !conflict && destination == null
+        ? marked.destination
+        : null;
+    if (conflict || fillOrigin != null || fillDestination != null) {
+      debugPrint(
+        '[EASY_BUS_VOICE] 원문 보완 충돌=$conflict 출발지보완=${fillOrigin != null} '
+        '목적지보완=${fillDestination != null}'
+        '${kDebugMode ? ' (출발="${fillOrigin ?? ''}", 도착="${fillDestination ?? ''}")' : ''}',
+      );
+    }
+    if (origin == null &&
+        destination == null &&
+        !result.useCurrentLocation &&
+        fillOrigin == null &&
+        fillDestination == null &&
+        !conflict) {
       // 해석 결과가 비어 있어도 장소를 구분할 근거가 분명한 부분은 입력창에 남긴다.
       // 남긴 글자는 확정되지 않은 부분 인식이므로 경로 검색으로 넘어가지 않고 기존 단계로 다시 묻는다.
       final slot =
@@ -916,11 +947,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (result.useCurrentLocation) {
       _origin.text = '';
       _voiceCurrentLocation = true;
-    } else if (result.origin != null) {
-      _origin.text = result.origin!;
+    } else if (origin != null) {
+      _origin.text = origin;
       _voiceCurrentLocation = false;
     }
-    if (result.destination != null) _destination.text = result.destination!;
+    if (destination != null) _destination.text = destination;
+    // 원문으로 보완한 장소는 비어 있는 입력창에만 넣고, 이미 입력·확정된 장소는 덮어쓰지 않는다.
+    if (fillOrigin != null &&
+        _origin.text.trim().isEmpty &&
+        !_voiceCurrentLocation) {
+      _origin.text = fillOrigin;
+    }
+    if (fillDestination != null && _destination.text.trim().isEmpty) {
+      _destination.text = fillDestination;
+    }
     final hasOrigin = _voiceCurrentLocation || _origin.text.trim().isNotEmpty;
     final hasDestination = _destination.text.trim().isNotEmpty;
     if (hasOrigin && hasDestination) {
@@ -934,8 +974,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         : 'destination';
     // 한 항목을 얻고 다른 항목을 새로 묻는 경우만 다음 단계의 한도를 시작한다.
     if (slot != _awaitingSlot &&
-        (result.origin != null ||
-            result.destination != null ||
+        (origin != null ||
+            destination != null ||
+            fillOrigin != null ||
+            fillDestination != null ||
             result.useCurrentLocation)) {
       _voiceAttempts = 0;
     }
@@ -953,7 +995,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   // 문장 해석에 실패했을 때 인식 문장에서 장소를 구분할 근거가 분명한 문자열만 꺼낸다.
   // '~에서 ~로/까지' 같은 출발·도착 표현이 있거나, 한 항목만 물은 단계의 짧은 대답인 경우만 사용한다.
-  ({String? origin, String? destination}) _partialPlaces(String text) {
+  // markedOnly는 해석 결과를 보완할 때 사용하며 출발·도착 표현이 있는 경우만 꺼낸다.
+  ({String? origin, String? destination}) _partialPlaces(
+    String text, {
+    bool markedOnly = false,
+  }) {
     // 문장 끝의 부탁·어미 표현과 문장부호를 지워 장소 이름만 남긴다.
     String clean(String value) {
       var result = value.replaceAll(RegExp(r'[.,!?~…]'), ' ').trim();
@@ -983,18 +1029,22 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     final sentence = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    // '~에서/~부터 ~로/까지', '~에서 출발해서 ~에 가고'처럼 출발·도착이 함께 있는 표현이다.
     final both = RegExp(
-      r'^(.+?)\s*에서\s*(.+?)\s*(?:으로|로|까지)(?:\s|$)',
+      r'^(.+?)\s*(?:에서부터|에서|부터)\s*(.+?)\s*(?:(?:으로|로|까지)(?:\s|$)|에\s*(?:가|갈|도착))',
     ).firstMatch(sentence);
     if (both != null) {
       return (origin: place(both[1]!), destination: place(both[2]!));
     }
-    final from = RegExp(r'^(.+?)\s*에서\s*(?:출발|떠나)').firstMatch(sentence);
+    final from = RegExp(
+      r'^(.+?)\s*(?:에서부터|에서|부터)\s*(?:출발|떠나)',
+    ).firstMatch(sentence);
     if (from != null) return (origin: place(from[1]!), destination: null);
     final to = RegExp(
       r'^(.+?)\s*(?:으로|로|까지)\s*(?:가|갈|데려|이동)',
     ).firstMatch(sentence);
     if (to != null) return (origin: null, destination: place(to[1]!));
+    if (markedOnly) return (origin: null, destination: null);
     // 구분 표현이 없으면 출발지 또는 목적지 하나만 물은 단계의 대답으로만 사용한다.
     if (_awaitingSlot == 'origin') {
       return (origin: place(sentence), destination: null);
