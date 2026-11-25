@@ -114,6 +114,8 @@ async def speech(file: UploadFile = File(...)):
                 if size > config.MAX_AUDIO_BYTES:
                     raise location_service.ServiceError("AUDIO_TOO_LARGE", "음성 파일이 너무 큽니다.", 413)
                 output.write(chunk)
+        ai_service.logger.info("음성 요청 수신 파일명=%s 형식=%s 저장크기=%dB 저장완료",
+                               file.filename, file.content_type, size)
         return {"text": await run_in_threadpool(ai_service.transcribe, path)}
     finally:
         await file.close()

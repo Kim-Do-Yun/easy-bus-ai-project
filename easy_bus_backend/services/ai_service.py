@@ -1,9 +1,12 @@
+import logging
+import os
 import re
 import threading
 import wave
 from typing import Literal
 
 import httpx
+import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from easy_bus_backend.core import config
@@ -118,6 +121,10 @@ intent는 route_search 또는 unknown. origin, destination은 문장에 나온 �
 
 _model = None
 _lock = threading.Lock()
+# uvicorn 기본 로그 설정에 연결하여 백엔드 터미널에 음성 처리 과정과 예외 원인을 출력한다.
+logger = logging.getLogger("uvicorn.error").getChild("speech")
+# Whisper 입력 샘플링 주파수이다.
+_SAMPLE_RATE = 16000
 
 
 def transcribe(path: str) -> str:
@@ -125,14 +132,34 @@ def transcribe(path: str) -> str:
     # 앱에서 생성한 PCM WAV만 허용하고 길이를 검사한 뒤 모델을 실행한다.
     try:
         with wave.open(path, "rb") as audio:
+            channels, width, rate, frames = (audio.getnchannels(), audio.getsampwidth(),
+                                             audio.getframerate(), audio.getnframes())
+            logger.info("음성 파일 형식 크기=%dB 채널=%d 비트=%d 샘플링=%dHz 프레임=%d",
+                        os.path.getsize(path), channels, width * 8, rate, frames)
             # 녹음은 되었으나 소리 데이터가 없는 경우를 길이 초과와 구분한다.
-            if audio.getnframes() == 0:
+            if frames == 0:
                 raise ServiceError("EMPTY_AUDIO", "녹음된 소리가 없습니다. 다시 녹음해 주세요.", 422)
-            duration = audio.getnframes() / audio.getframerate()
+            duration = frames / rate
             if not 0 < duration <= config.MAX_AUDIO_SECONDS:
                 raise ServiceError("AUDIO_DURATION", f"음성은 {config.MAX_AUDIO_SECONDS}초 이내로 녹음해 주세요.", 422)
+            pcm = audio.readframes(frames)
     except (wave.Error, EOFError, ZeroDivisionError) as exc:
+        logger.warning("WAV 해석 실패 %s: %s", type(exc).__name__, exc)
         raise ServiceError("INVALID_AUDIO", "올바른 PCM WAV 음성 파일이 아닙니다.", 415) from exc
+    if width != 2:
+        logger.warning("지원하지 않는 WAV 비트 깊이=%d", width * 8)
+        raise ServiceError("INVALID_AUDIO", "16bit PCM WAV 음성 파일만 지원합니다.", 415)
+    # 설치된 PyAV 19는 faster-whisper 1.2.1의 파일 디코딩 인자(metadata_errors)를 지원하지 않으므로,
+    # 검증한 PCM 데이터를 직접 float32 배열로 변환하여 PyAV 디코딩을 거치지 않고 전달한다.
+    samples = np.frombuffer(pcm[:len(pcm) - len(pcm) % (2 * channels)], dtype="<i2").astype(np.float32) / 32768.0
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    if rate != _SAMPLE_RATE and samples.size:
+        # 16kHz가 아닌 녹음은 선형 보간으로 Whisper 입력 주파수에 맞춘다.
+        target = np.arange(int(samples.size * _SAMPLE_RATE / rate)) * (rate / _SAMPLE_RATE)
+        samples = np.interp(target, np.arange(samples.size), samples).astype(np.float32)
+    logger.info("음성 데이터 변환 길이=%.2f초 샘플=%d 최대음량=%.3f",
+                samples.size / _SAMPLE_RATE, samples.size, float(np.abs(samples).max()) if samples.size else 0.0)
     # 로딩과 추론을 직렬화하여 모델 중복 생성 및 CPU 과부하를 방지한다.
     if not _lock.acquire(blocking=False):
         raise ServiceError("SPEECH_BUSY", "다른 음성을 처리 중입니다. 잠시 후 다시 시도해 주세요.", 429)
@@ -141,20 +168,34 @@ def transcribe(path: str) -> str:
             # 로컬 폴더의 모델을 우선 사용하고, 없으면 이미 설치된 캐시 모델을 다운로드 없이 불러온다.
             local = (config.WHISPER_PATH / "model.bin").is_file()
             source = str(config.WHISPER_PATH) if local else config.WHISPER_MODEL
+            logger.info("Whisper 모델 초기화 시작 경로=%s 장치=%s 연산형식=%s",
+                        "로컬 폴더" if local else f"캐시 모델({source})", config.WHISPER_DEVICE, config.WHISPER_COMPUTE_TYPE)
             try:
                 from faster_whisper import WhisperModel
                 _model = WhisperModel(source, device=config.WHISPER_DEVICE,
                                       compute_type=config.WHISPER_COMPUTE_TYPE, local_files_only=True)
             except Exception as exc:
+                logger.exception("Whisper 모델 초기화 실패 %s: %s", type(exc).__name__, exc)
                 raise ServiceError("WHISPER_LOAD_FAILED", "Whisper Small 모델을 불러오지 못했습니다. 모델 설치 위치를 확인해 주세요.") from exc
+            logger.info("Whisper 모델 초기화 완료 장치=%s 연산형식=%s", _model.model.device, _model.model.compute_type)
         try:
-            segments, _ = _model.transcribe(path, language="ko", vad_filter=True, beam_size=5,
-                                            condition_on_previous_text=False)
+            logger.info("음성 인식 시작")
+            segments, info = _model.transcribe(samples, language="ko", vad_filter=True, beam_size=5,
+                                               condition_on_previous_text=False)
+            logger.info("VAD 처리 결과 전체=%.2f초 말소리구간=%.2f초", info.duration, info.duration_after_vad)
             # 말소리가 없을 가능성이 높고 신뢰도도 낮은 구간은 임의 문장으로 보고 제외한다.
-            text = " ".join(segment.text.strip() for segment in segments
-                            if not (segment.no_speech_prob > 0.6 and segment.avg_logprob < -1.0)).strip()
+            kept = []
+            for segment in segments:
+                dropped = segment.no_speech_prob > 0.6 and segment.avg_logprob < -1.0
+                logger.info("인식 구간 %.2f~%.2f초 무음확률=%.2f 신뢰도=%.2f 제외=%s 문장=%r", segment.start, segment.end,
+                            segment.no_speech_prob, segment.avg_logprob, dropped, segment.text.strip())
+                if not dropped:
+                    kept.append(segment.text.strip())
+            text = " ".join(kept).strip()
         except Exception as exc:
+            logger.exception("음성 인식 실패 %s: %s", type(exc).__name__, exc)
             raise ServiceError("SPEECH_FAILED", "음성을 인식하지 못했습니다.", 422) from exc
+        logger.info("음성 인식 완료 결과=%r", text)
         if not text:
             raise ServiceError("EMPTY_SPEECH", "말소리를 찾지 못했습니다. 다시 녹음해 주세요.", 422)
         return text

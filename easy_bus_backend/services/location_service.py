@@ -234,6 +234,9 @@ class _CredentialFilter(logging.Filter):
 for _logger in ("httpx", "httpcore.connection", "httpcore.http11", "httpcore.http2",
                 "httpcore.proxy", "httpcore.socks"):
     logging.getLogger(_logger).addFilter(_CredentialFilter())
+# 외부 API 인증 실패 사유는 uvicorn 터미널에 출력하되 인증값은 같은 필터로 숨긴다.
+_auth_logger = logging.getLogger("uvicorn.error").getChild("transit")
+_auth_logger.addFilter(_CredentialFilter())
 
 
 def request_json(provider, url, params, deadline, headers=None):
@@ -245,6 +248,9 @@ def request_json(provider, url, params, deadline, headers=None):
         with httpx.Client(timeout=min(config.TRANSIT_HTTP_TIMEOUT, remaining)) as client:
             response = client.get(url, params=params, headers=headers)
         if response.status_code in (401, 403):
+            # 공급자가 반환한 인증 오류 사유를 인증값 없이 백엔드 터미널에 남긴다.
+            _auth_logger.warning("%s 인증 실패 HTTP %d 사유=%s", provider, response.status_code,
+                                                       re.sub(r"\s+", " ", response.text)[:300])
             raise ServiceError(f"{provider}_AUTH_FAILED", f"{provider} API 인증 또는 이용 권한을 확인해 주세요.")
         if response.status_code == 429:
             raise ServiceError(f"{provider}_QUOTA_EXCEEDED", f"{provider} API 호출 한도를 초과했습니다.", 429)
