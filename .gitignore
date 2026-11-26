@@ -30,3 +30,14 @@ easy_bus_ai/ios/.symlinks/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# --- APK / PowerShell ---
+*.apk
+*.ps1
+
+# --- Environment / Configuration ---
+.env
+.env.*
+env.example
+easy_bus_ai/config/app.json
+easy_bus_ai/config/app.example.json

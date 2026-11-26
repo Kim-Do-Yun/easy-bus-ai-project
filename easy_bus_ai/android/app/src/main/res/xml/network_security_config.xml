@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Release APK는 HTTP 평문 통신이 기본 차단되므로 내부망 백엔드 주소만 허용한다.
+     그 밖의 주소는 Android 기본 보안 정책(HTTPS)을 그대로 유지한다.
+     config/app.json의 API_BASE_URLS 주소가 바뀌면 이 목록도 함께 수정한다. -->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- USB 연결(adb reverse) -->
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+        <!-- 개인 노트북 -->
+        <domain includeSubdomains="false">172.30.1.8</domain>
+        <!-- 회사 PC -->
+        <domain includeSubdomains="false">192.168.0.130</domain>
+        <!-- Android 에뮬레이터의 기존 기본 서버 주소 -->
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>
