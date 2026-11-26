@@ -91,6 +91,11 @@ class ApiService {
   static Future<String?> _selectBaseUrl() async {
     final elapsed = Stopwatch()..start();
     final client = IOClient(HttpClient()..connectionTimeout = _probeTimeout);
+    // Release APK에서도 adb logcat으로 확인할 수 있도록 탐색 대상과 결과를 기록한다.
+    debugPrint(
+      '[EASY_BUS_API] 서버 탐색 시작 대상=${baseUrls.length}개 '
+      '(${baseUrls.join(',')})',
+    );
     try {
       final results = await Future.wait(
         baseUrls.map((url) => _isEasyBusBackend(client, url)),
@@ -103,6 +108,9 @@ class ApiService {
         '응답=${results.where((ok) => ok).length}/${baseUrls.length} '
         '(${elapsed.elapsedMilliseconds}ms)',
       );
+      if (selected == null) {
+        debugPrint('[EASY_BUS_API] 서버 선택 실패 사유=정상 응답한 서버 없음 (서버별 확인 결과 참고)');
+      }
       return selected;
     } finally {
       // 제한시간을 넘긴 확인 요청도 함께 중단한다.
@@ -113,22 +121,59 @@ class ApiService {
   // 기존 상태 확인 API만 호출하며 Whisper·Qwen·TAGO 등 실제 처리나 외부 API는 실행하지 않는다.
   // 정상 응답은 서버 실행 여부만 뜻하며 Ollama·외부 API의 정상 동작까지 보장하지 않는다.
   static Future<bool> _isEasyBusBackend(http.Client client, String url) async {
+    final elapsed = Stopwatch()..start();
+    final healthUrl = '$url/api/health';
+    debugPrint('[EASY_BUS_API] 서버 확인 요청 $healthUrl');
     try {
       final response = await client
-          .get(Uri.parse('$url/api/health'))
+          .get(Uri.parse(healthUrl))
           .timeout(_probeTimeout);
-      if (response.statusCode != 200) return false;
-      final body = jsonDecode(utf8.decode(response.bodyBytes));
+      final dynamic body;
+      try {
+        body = jsonDecode(utf8.decode(response.bodyBytes));
+      } on FormatException {
+        debugPrint(
+          '[EASY_BUS_API] 서버 확인 $url 상태=${response.statusCode} '
+          '판정=제외(JSON 아님) (${elapsed.elapsedMilliseconds}ms)',
+        );
+        return false;
+      }
       // 다른 프로그램의 응답과 구분하도록 기존 상태 확인 응답의 내용까지 확인한다.
       final message = body is Map ? body['message'] : null;
-      return body is Map &&
+      final ok =
+          response.statusCode == 200 &&
+          body is Map &&
           body['status'] == 'ok' &&
           message is String &&
           message.contains('Easy AI Bus');
+      // 응답 본문 원문은 기록하지 않고 판정에 쓴 항목의 일치 여부만 기록한다.
+      debugPrint(
+        '[EASY_BUS_API] 서버 확인 $url 상태=${response.statusCode} '
+        '판정=${ok ? '정상' : '제외'} '
+        'status일치=${body is Map && body['status'] == 'ok'} '
+        'message일치=${message is String && message.contains('Easy AI Bus')} '
+        '(${elapsed.elapsedMilliseconds}ms)',
+      );
+      return ok;
     } catch (error) {
-      debugPrint('[EASY_BUS_API] 서버 확인 실패 $url 유형=${error.runtimeType}');
+      debugPrint(
+        '[EASY_BUS_API] 서버 확인 실패 $url 유형=${error.runtimeType} '
+        '내용=${_describeError(error)} (${elapsed.elapsedMilliseconds}ms)',
+      );
       return false;
     }
+  }
+
+  // 연결 오류의 원인만 남기고, 검색어가 포함될 수 있는 요청 URL은 기록하지 않는다.
+  static String _describeError(Object error) {
+    if (error is SocketException) {
+      final os = error.osError;
+      return '${error.message}'
+          '${os == null ? '' : ' (OS 오류=${os.message}, errno=${os.errorCode})'}';
+    }
+    if (error is http.ClientException) return error.message;
+    if (error is TimeoutException) return '제한시간 ${_probeTimeout.inSeconds}초 초과';
+    return error.runtimeType.toString();
   }
 
   // 다른 요청이 이미 새 서버를 골랐다면 그 선택은 유지한다.
@@ -230,11 +275,19 @@ class ApiService {
       throw ApiException('요청이 취소되었습니다.', 'REQUEST_CANCELLED');
     } on TimeoutException {
       throw ApiException('서버 응답이 늦습니다. 잠시 후 다시 시도해 주세요.', 'NETWORK_TIMEOUT');
-    } on SocketException {
+    } on SocketException catch (error) {
       // 연결 실패만 선택을 해제하고, 서버의 정상 오류 응답·응답 지연은 서버를 바꾸지 않는다.
+      debugPrint(
+        '[EASY_BUS_API] 연결 실패 서버=$base 유형=${error.runtimeType} '
+        '내용=${_describeError(error)}',
+      );
       _forgetBaseUrl(base);
       throw _ConnectionLost('서버에 연결할 수 없습니다. 네트워크 연결을 확인해 주세요.');
-    } on http.ClientException {
+    } on http.ClientException catch (error) {
+      debugPrint(
+        '[EASY_BUS_API] 연결 실패 서버=$base 유형=${error.runtimeType} '
+        '내용=${_describeError(error)}',
+      );
       _forgetBaseUrl(base);
       throw _ConnectionLost('서버 연결이 끊어졌습니다. 다시 시도해 주세요.');
     } on FormatException {
