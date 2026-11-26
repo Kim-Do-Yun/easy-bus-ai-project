@@ -56,9 +56,8 @@ class BusDetailScreen extends StatelessWidget {
     final number = first.bus?.number ?? '';
     final arrival = first.arrival;
     final parts = <String>[
-      arrival.available
-          ? '$number번 버스는 현재 ${arrival.remainingStops != null ? '${arrival.remainingStops}정류장 전이며, ' : ''}약 ${arrival.minutes}분 뒤 ${first.start.name} 정류장에 도착합니다.'
-          : '$number번 버스의 실시간 도착정보가 없습니다.',
+      // 결과 화면 음성 안내와 같은 도착정보 문장을 사용하여 같은 버스를 서로 다르게 안내하지 않는다.
+      arrival.voiceText(number, first.start.name),
       first.stops.length >= 2
           ? '${first.start.name}에서 타고 ${first.stops.length - 1}정류장 이동한 뒤 ${first.end.name}에서 내리세요.'
           : '${first.start.name}에서 타고 ${first.end.name}에서 내리세요.',

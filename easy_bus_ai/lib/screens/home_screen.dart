@@ -149,8 +149,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool get _inputLocked =>
       _busy || _audioTransition || _phase == HomePhase.recording;
 
+  // 출발지 입력창에 표시하는 현재 위치 문구이며 경로 검색 시 기존 현재 위치 조회(_currentOrigin)를 사용한다.
+  static const _currentLabel = '현재 위치';
+
   // 입력창 문구와 같은 이름의 장소가 후보 목록에서 확정되어 좌표가 있는 상태이다.
+  // 출발지 입력창의 '현재 위치'는 후보 선택 없이 기존 현재 위치 조회로 좌표를 얻으므로 확정으로 본다.
   bool _confirmed(bool isOrigin) {
+    if (isOrigin && _origin.text.trim() == _currentLabel) return true;
     final place = isOrigin ? _originPlace : _destinationPlace;
     return place != null &&
         place.name == (isOrigin ? _origin : _destination).text.trim();
@@ -292,6 +297,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       /* 지도 마커 표시 실패는 좌표 확정을 막지 않는다. */
     }
     if (!mounted || generation != _request) return;
+    // 출발지 입력창을 비워 둔 채 목적지 후보를 고르면 현재 위치를 출발지로 정하고 바로 경로를 검색한다.
+    // 출발지에 글자가 있거나(후보 미선택 포함) 음성 대화에서 출발지를 다시 물은 상태는 제외한다.
+    if (!isOrigin && _origin.text.trim().isEmpty && !_originRequested) {
+      _useCurrentOrigin();
+    }
     setState(() {
       _voiceAttempts = 0;
       _voiceProblem = null;
@@ -961,8 +971,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (fillDestination != null && _destination.text.trim().isEmpty) {
       _destination.text = fillDestination;
     }
-    final hasOrigin = _voiceCurrentLocation || _origin.text.trim().isNotEmpty;
+    var hasOrigin = _voiceCurrentLocation || _origin.text.trim().isNotEmpty;
     final hasDestination = _destination.text.trim().isNotEmpty;
+    // 목적지만 말하고 출발지를 따로 지정하지 않았으면 출발지를 다시 묻지 않고 현재 위치를 출발지로 사용한다.
+    // 출발지를 다시 물은 상태, '~에서'·'~부터' 같은 출발 표현을 말했지만 추출하지 못한 경우,
+    // 출발·도착이 뒤바뀐 경우는 출발지 미지정으로 보지 않고 기존처럼 다시 묻는다.
+    if (!hasOrigin &&
+        hasDestination &&
+        !conflict &&
+        !_originRequested &&
+        !_mentionsOrigin(text)) {
+      _useCurrentOrigin();
+      hasOrigin = true;
+      debugPrint('[EASY_BUS_VOICE] 출발지 미지정: 현재 위치를 출발지로 사용');
+    }
     if (hasOrigin && hasDestination) {
       _awaitingSlot = null;
       return true;
@@ -1083,7 +1105,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (slot != null) {
       _awaitingSlot = slot;
       // 출발지를 물은 경우 비어 있는 출발지로 자동 경로 검색을 하지 않는다.
-      _originRequested = slot == 'origin' || slot == 'both';
+      // 출발지·목적지를 함께 물은 경우는 들은 말씀에 출발 표현이 있었을 때만 출발지를 물은 것으로 본다.
+      _originRequested =
+          slot == 'origin' ||
+          (slot == 'both' && heard != null && _mentionsOrigin(heard));
     }
     if (_voiceAttempts >= VoicePolicy.maxAttempts) {
       message = '$question 음성 입력 횟수를 모두 사용했습니다. 글자로 입력해 주세요.';
@@ -1095,6 +1120,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     } catch (_) {
       /* 재질문 음성 재생 실패는 화면 안내로 대신한다. */
     }
+  }
+
+  // 발화에 '~에서', '~부터' 같은 출발 표현이 있는지 확인한다. '여기에서'처럼 현재 위치를 뜻하는 표현은 제외한다.
+  static bool _mentionsOrigin(String text) {
+    final compact = text.replaceAll(RegExp(r'\s+'), '').replaceAll(
+      RegExp(r'(여기|이곳|현재위치|지금위치|내위치|제위치|현위치)(에서부터|에서|부터)?'),
+      '',
+    );
+    return RegExp(r'에서|부터').hasMatch(compact);
+  }
+
+  // 출발지를 따로 지정하지 않았을 때 출발지 입력창을 '현재 위치'로 정한다. 음성·글자 입력이 같은 처리를 사용한다.
+  // 좌표는 경로 검색 시 기존 _currentOrigin()으로 조회하므로 고정 위치·GPS 설정을 그대로 따른다.
+  // 문구 변경 감지에서 이전 출발지 확정 장소와 선택 마커는 해제되어 새 검색에 섞이지 않는다.
+  void _useCurrentOrigin() {
+    _originRequested = false;
+    _origin.text = _currentLabel;
   }
 
   void _resetVoice() {
@@ -1121,6 +1163,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     } catch (error) {
       if (!_valid(id)) return null;
       _voiceCurrentLocation = false;
+      // 자동으로 채운 '현재 위치' 문구는 비워 다음 입력에서 현재 위치를 다시 출발지로 쓰지 않게 한다.
+      if (_origin.text.trim() == _currentLabel) _origin.clear();
       setState(() {
         _voiceProblem = error.toString();
         _editingInputs = true;
@@ -2275,6 +2319,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
           ),
           // 디자인의 원형 보조 버튼 자리에 기존 '안내 다시 듣기' 기능을 연결한다.
+          // 마지막으로 재생한 임의 문장(오류·재질문) 대신 현재 선택한 추천 경로의 안내를 실시간 도착정보와 함께 다시 들려준다.
+          // speak()가 이전 재생을 멈춘 뒤 재생하므로 여러 번 눌러도 겹쳐 들리지 않는다.
           Material(
             color: EasyColors.surfaceContainer,
             shape: const CircleBorder(),
@@ -2283,8 +2329,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               onTap: _busy || _phase == HomePhase.recording
                   ? null
                   : () async {
+                      final route = _route;
+                      if (route == null) return;
                       try {
-                        await _device.repeat();
+                        await _device.speak(route.guidance);
                       } catch (error) {
                         _notice('음성 안내를 재생하지 못했습니다.');
                       }

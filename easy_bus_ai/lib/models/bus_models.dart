@@ -107,6 +107,34 @@ class BusArrival {
   String get label => status == 'available' && minutes != null
       ? '도착 예정 $minutes분'
       : '실시간 도착정보 미제공';
+  // 음성 안내용 도착정보 문장이며 TAGO가 실제로 제공한 값만 사용하고 없는 값은 만들지 않는다.
+  // 서버는 음수·형식 오류 값을 미제공으로 처리하므로 0분·0정류장은 곧 도착하는 실제 값으로 본다.
+  String voiceText(String number, String stopName) {
+    final bus = number.trim().isEmpty ? '버스' : '${number.trim()}번 버스';
+    final valid = status == 'available';
+    final m = valid && minutes != null && minutes! >= 0 ? minutes : null;
+    final r = valid && remainingStops != null && remainingStops! >= 0
+        ? remainingStops
+        : null;
+    final stop = stopName.trim().isEmpty ? '' : '${stopLabel(stopName)}에 ';
+    final time = m == null
+        ? null
+        : m == 0
+        ? '곧 $stop도착할 예정입니다.'
+        : '약 $m분 후 $stop도착할 예정입니다.';
+    if (r != null && r > 0 && time != null) return '$bus는 현재 $r정류장 전이며, $time';
+    if (time != null) return '$bus는 $time';
+    if (r != null) {
+      return r > 0 ? '$bus는 현재 $r정류장 전에 있습니다.' : '$bus는 곧 도착할 예정입니다.';
+    }
+    return '$bus의 실시간 도착정보를 확인할 수 없습니다.';
+  }
+
+  // 정류장 이름 뒤에 '정류장'을 붙이되 이미 정류장·정류소로 끝나면 그대로 사용한다.
+  static String stopLabel(String name) {
+    final text = name.trim();
+    return text.endsWith('정류장') || text.endsWith('정류소') ? text : '$text 정류장';
+  }
 }
 
 class RouteSegment {
@@ -153,6 +181,25 @@ class RouteSegment {
     ];
     return parts.isEmpty ? null : '도보 ${parts.join(', ')}';
   }
+
+  // 음성 안내용 도보 거리·시간이며 단위를 읽기 쉬운 말로 쓴다.
+  // 값이 없으면 빈 문자열, 거리와 시간이 모두 0이면 걸을 필요가 없는 구간으로 보고 null을 반환한다.
+  String? get walkSpeech {
+    if (type != 'WALK') return null;
+    final d = distanceM, m = durationMinutes;
+    if ((d != null || m != null) && (d ?? 0) <= 0 && (m ?? 0) <= 0) return null;
+    final meters = d ?? 0;
+    final hasDistance = meters > 0;
+    final parts = [
+      if (hasDistance)
+        meters >= 1000
+            ? '약 ${(meters / 1000).toStringAsFixed(1)}킬로미터'
+            : '약 ${meters.round()}미터',
+      // 거리 문구가 앞에 있으면 시간 문구의 '약'을 반복하지 않는다.
+      if (m != null && m > 0) hasDistance ? '${m.round()}분' : '약 ${m.round()}분',
+    ];
+    return parts.join(', ');
+  }
 }
 
 class BusRoute {
@@ -171,13 +218,59 @@ class BusRoute {
       segments = (j['segments'] as List)
           .map((s) => RouteSegment.fromJson(s))
           .toList();
-  String get guidance => segments
-      .map(
-        (s) => s.type == 'BUS'
-            ? '${s.start.name}에서 ${s.bus?.number ?? ""}번 버스를 타고 ${s.end.name}에서 내리세요.'
-            : '${s.start.name}에서 ${s.end.name}까지 도보 구간입니다.${s.walkText == null ? '' : ' ${s.walkText}.'}',
-      )
-      .join(' ');
+  // 경로 결과 화면의 음성 안내 문장이며 경로 검색 응답에 담긴 이 경로의 값만으로 만든다.
+  // 총 소요시간·환승 → 승차 정류장까지 도보 → 첫 버스 실시간 도착정보 → 승차·이동 정류장 수·하차 → 환승 → 목적지까지 도보 순서이다.
+  // 실시간 도착정보는 첫 승차 버스만 안내하며, 환승 버스의 현재 조회값은 환승 시점 도착시간으로 오해할 수 있어 읽지 않는다.
+  String get guidance {
+    final parts = <String>[];
+    final total = durationMinutes != null && durationMinutes! > 0
+        ? '약 ${durationMinutes!.round()}분'
+        : null;
+    final transfer = transferCount > 0
+        ? '${const ['한', '두', '세', '네'].elementAtOrNull(transferCount - 1) ?? '$transferCount'} 번 환승해야 합니다'
+        : null;
+    if (total != null) {
+      parts.add(
+        transfer == null ? '목적지까지 $total이 걸립니다.' : '목적지까지 $total이 걸리며, $transfer.',
+      );
+    } else if (transfer != null) {
+      parts.add('목적지까지 $transfer.');
+    }
+    var busIndex = 0;
+    for (var i = 0; i < segments.length; i++) {
+      final s = segments[i];
+      if (s.type == 'BUS') {
+        final number = s.bus?.number.trim() ?? '';
+        final bus = number.isEmpty ? '버스' : '$number번 버스';
+        // 이동 정류장 수는 승하차 정류장이 양 끝과 일치하는 경유 정류장 목록이 있을 때만 안내한다.
+        final ride = s.stops.length >= 2
+            ? '${s.stops.length - 1}개 정류장을 이동한 후'
+            : '이동한 후';
+        final end = BusArrival.stopLabel(s.end.name);
+        if (busIndex == 0) {
+          parts.add(s.arrival.voiceText(number, s.start.name));
+          parts.add('$bus에 탑승하여 $ride $end에서 내리세요.');
+        } else {
+          parts.add(
+            '${BusArrival.stopLabel(s.start.name)}에서 $bus로 갈아타고 $ride $end에서 내리세요.',
+          );
+        }
+        busIndex++;
+        continue;
+      }
+      final walk = s.walkSpeech;
+      if (walk == null) continue;
+      final amount = walk.isEmpty ? '' : '$walk ';
+      if (i == segments.length - 1) {
+        parts.add('하차 후 $amount걸어가시면 목적지에 도착합니다.');
+      } else {
+        parts.add(
+          '${busIndex == 0 ? '' : '환승할 '}${BusArrival.stopLabel(s.end.name)}까지 $amount걸어가세요.',
+        );
+      }
+    }
+    return parts.join(' ');
+  }
   List<RouteSegment> get busSegments =>
       segments.where((s) => s.type == 'BUS').toList();
   // 총 도보시간은 모든 도보 구간의 ODsay 소요시간이 있을 때만 합산하고, 하나라도 없으면 표시하지 않는다.
